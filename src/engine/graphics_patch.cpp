@@ -89,6 +89,7 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<std::uint64_t> g_seen_serial{0};
+std::mutex g_refresh_mu;
 std::atomic<bool> g_ssao{true}, g_aa{true};
 
 // ---- Draw parameters ---------------------------------------------------------
@@ -338,8 +339,10 @@ GUEST_ABI std::int64_t velocity_post_hook(std::uint64_t, const std::uint64_t*) {
 
 void refresh_settings() {
     const std::uint64_t serial = host_opt_serial();
-    if (g_seen_serial.exchange(serial) == serial) return;
+    if (g_seen_serial.load(std::memory_order_acquire) == serial) return;
+    std::lock_guard<std::mutex> lock(g_refresh_mu);
     const HostSettings hs = host_settings();
+    if (g_seen_serial.load(std::memory_order_relaxed) == hs.serial) return;
     g_ssao.store(hs.ssao);
     g_aa.store(hs.anti_alias);
     set_chromatic_aberration(hs.chromatic_aberration);
@@ -352,6 +355,7 @@ void refresh_settings() {
     if (!g_lod_bias_env) g_lod_bias.store(hs.lod_bias);
     g_shadow_scale.store(hs.shadow_scale > 1.0f ? hs.shadow_scale
                                                 : g_shadow_scale_env > 0.0f ? g_shadow_scale_env : 1.0f);
+    g_seen_serial.store(hs.serial, std::memory_order_release);
 }
 
 // sub_12669d0's entry: the SSAO object in rdi, its block just copied in.

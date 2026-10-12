@@ -1,6 +1,7 @@
 #include "host/options.h"
 #include "host/updater.h"
 #include "host/settings.h"
+#include "host/settings_snapshot.h"
 
 #include "host/bindings.h"
 #include "host/overlay.h"
@@ -693,21 +694,16 @@ void save() {
     host_log("options: saved %s", path.c_str());
 }
 
-// Bumped on every change, for readers that act on a setting live and would
-// rather not look it up by name on every frame (host_opt_serial).
-std::atomic<std::uint64_t> g_serial{1};
-
 // The settings object (host/settings.h): every field from the table, scaled
-// the way its consumer wants it, rebuilt whenever a setting changes.
-std::mutex g_settings_mu;
-HostSettings g_settings;
+// the way its consumer wants it, rebuilt whenever a setting changes. The
+// generation is published with the snapshot, never before it is ready.
+HostSettingsSnapshot g_settings;
 
 bool on_of(int id) { return reads_on(g_set[id], g_set[id].index); }
 int index_of(int id) { return g_set[id].index; }
 
 void rebuild_settings() {
     HostSettings h;
-    h.serial = g_serial.load(std::memory_order_acquire);
     h.fullscreen = index_of(kWindowMode) == 1;
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
@@ -770,8 +766,7 @@ void rebuild_settings() {
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    g_settings = h;
+    g_settings.publish(h);
 }
 
 void set_index(int id, int index, bool from_file) {
@@ -786,7 +781,6 @@ void set_index(int id, int index, bool from_file) {
         if (index == g_res_prev) g_res_prev = -1;  // back where it started: nothing to ask
     }
     s.index = index;
-    g_serial.fetch_add(1, std::memory_order_release);
     rebuild_settings();
     if (!from_file) {
         g_dirty = true;
@@ -1350,8 +1344,7 @@ void options_panel_frame(float display_w, float display_h) {
 }  // namespace
 
 HostSettings host_settings() {
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    return g_settings;
+    return g_settings.read();
 }
 
 namespace {
@@ -1377,7 +1370,7 @@ int setting_id(const char* key) {
 
 }  // namespace
 
-std::uint64_t host_opt_serial() { return g_serial.load(std::memory_order_acquire); }
+std::uint64_t host_opt_serial() { return g_settings.serial(); }
 
 bool host_opt_default_get(const char* key) {
     const int id = setting_id(key);
