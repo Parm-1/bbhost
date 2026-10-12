@@ -14,7 +14,10 @@
 # config's data/saves); PERF_SECONDS (150), PERF_HEADLESS (1); PERF_UNCAPPED
 # (1, the default: BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1 - no frame target and
 # flips complete at once, the machine's true frame rate standing still; 0: the
-# 60 cap).
+# 60 cap); PERF_TOML_EXTRA, a file appended to the run's bbhost.toml ([patches]
+# switches, ...); PERF_ETW=<seconds>: a WPR CPU trace that long, from PERF_ETW_AT
+# (70) seconds into the run (tools/etw: one UAC prompt), reported into
+# build/perf/NAME.etw.txt by thread, module and function.
 # Runs play on build/perf/data (a copy of the saves; the pipeline cache stays
 # between runs so compiles do not land in the measured seconds) and write
 # build/perf/NAME.log, NAME.perfmon.
@@ -59,12 +62,19 @@ check = false
 [bbhost]
 config_version = 3
 TOML
+[ -n "${PERF_TOML_EXTRA:-}" ] && cat "$PERF_TOML_EXTRA" >> "$out/cfg/bbhost.toml"
 rm -f "$out/data/bbhost/gpu-device-lost.txt" "$out/$NAME.perfmon"
 # Title: Cross through the "press any button", Continue and any notice.
 taps="20:cross,25:cross,30:cross,35:cross,40:cross,45:cross,50:cross"
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/perfmon.ps1 -Name bbhost -Seconds "$secs" -Out "$root/$out/$NAME.perfmon" > /dev/null 2>&1 &
 mon=$!
 [ -n "${PERF_FULLSCREEN:-}" ] && { PERF_HEADLESS=0; powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/keep_focus.ps1 -Name bbhost -Seconds "$((secs + 60))" > /dev/null 2>&1 & }
+etw=""
+if [ -n "${PERF_ETW:-}" ]; then
+    rm -f "$out/$NAME.etl"
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools/etw/record.ps1 -Delay "${PERF_ETW_AT:-70}"         -Seconds "$PERF_ETW" -Out "$root/$out/$NAME.etl" > "$out/$NAME.etw-record.txt" 2>&1 &
+    etw=$!
+fi
 uncap=()
 [ "${PERF_UNCAPPED:-1}" = 1 ] && uncap=(BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1)
 env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=1 BBHOST_SKIP_INTRO=1 \
@@ -74,3 +84,12 @@ env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=1
 echo "exit $?" >> "$out/$NAME.log"
 wait $mon 2>/dev/null
 python tools/perf_pass_summary.py "$out/$NAME.log" "$out/$NAME.perfmon"
+if [ -n "$etw" ]; then
+    wait $etw
+    if [ -f "$out/$NAME.etl" ]; then
+        python tools/etw/profile.py "$out/$NAME.etl" "$out/$NAME.etw.pickle" &&
+            python tools/etw/report.py "$out/$NAME.etw.pickle" --exe "$exe" --eboot "$eboot" --log "$out/$NAME.log"                 > "$out/$NAME.etw.txt" && echo "etw: $out/$NAME.etw.txt" && head -24 "$out/$NAME.etw.txt"
+    else
+        echo "etw: no trace ($(tail -1 "$out/$NAME.etw-record.txt"))"
+    fi
+fi
