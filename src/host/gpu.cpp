@@ -1772,14 +1772,17 @@ bool init_locked() {
         // BBHOST_GPU_CHECKPOINTS=amd turns them on.
         bool want_amd = c.buffer_marker && e && std::strcmp(e, "amd") == 0;
         // Unset, and the last run lost the device (its note beside the
-        // pipeline cache): these starts run with whichever this driver has.
-        // BBHOST_GPU_CHECKPOINTS=0 keeps them off.
+        // pipeline cache): these starts run with whichever this driver has -
+        // buffer markers first where there are any (NVIDIA's drivers have
+        // them too): they land in host memory, readable after the loss, and
+        // NVIDIA's Linux driver returned no checkpoints at all at three
+        // losses (an RTX 2060, 615.71). BBHOST_GPU_CHECKPOINTS=0 keeps them off.
         std::string why;
         if (!e && (c.checkpoints || c.buffer_marker) && take_marked_start(why)) {
-            (c.checkpoints ? want_nv : want_amd) = true;
+            (c.buffer_marker ? want_amd : want_nv) = true;
             host_log("gpu: the last run lost the device (%s): this start runs with the GPU's progress markers (%s), so another loss "
                      "names the draw the GPU was in; BBHOST_GPU_CHECKPOINTS=0 turns them off",
-                     why.c_str(), c.checkpoints ? "NVIDIA's checkpoints" : "AMD's buffer markers");
+                     why.c_str(), c.buffer_marker ? "buffer markers" : "NVIDIA's checkpoints");
         }
         g.has_checkpoints = want_nv || want_amd;
         g_use_buffer_marker = want_amd;
@@ -3693,7 +3696,11 @@ void report_checkpoints() {
     if (!get_data) return;
     std::uint32_t n = 0;
     get_data(g.queue, &n, nullptr);
-    if (!n) return;
+    if (!n) {
+        host_log("gpu: the driver kept no checkpoints for the device loss (NVIDIA's Linux driver has given none at three); "
+                 "BBHOST_GPU_CHECKPOINTS=amd names the draw through buffer markers instead");
+        return;
+    }
     std::vector<VkCheckpointDataNV> data(n, {VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
     get_data(g.queue, &n, data.data());
     host_log("gpu: %u checkpoint(s) at the device loss (the last work each stage reached):", n);
