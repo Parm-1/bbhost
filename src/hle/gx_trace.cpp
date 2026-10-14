@@ -6021,7 +6021,7 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
             std::memset(t_native_in.vs_user, 0, sizeof(t_native_in.vs_user));
             std::memset(t_native_in.ps_user, 0, sizeof(t_native_in.ps_user));
         }
-        if (g_native_drawn.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) {
+        if (g_native_drawn.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999 && host_tooling()) {
             std::size_t pending = 0;
             std::string stale;
             {
@@ -6343,7 +6343,7 @@ const GpuDrawInputs* hle_gx_trace_draw(std::uint32_t op, std::uint64_t packet_va
                 changed(kNfUserUnnamed, unnamed_changed);
             }
             t_native_shadow.erase(it);
-            if (g_native_matched.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) report_native();
+            if (g_native_matched.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999 && host_tooling()) report_native();
         }
     }
     if (g_native == 1 && found && e.gx && e.rec.native_id && e.rec.tess) {

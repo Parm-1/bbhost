@@ -9232,7 +9232,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written &&
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
-                g_cb_snapshots.fetch_add(1, std::memory_order_relaxed);
+                if (host_tooling()) g_cb_snapshots.fetch_add(1, std::memory_order_relaxed);
             }
             if (glitch_watching_draw()) {
                 glitch_watch_read_locked(base, bytes);
@@ -9252,7 +9252,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             static std::uint64_t segment_serial[kScratch / kScratchSegment] = {};
             static std::uint64_t segment_lap[kScratch / kScratchSegment] = {};
             static std::uint64_t scratch_lap = 1;
-            if (realign && bytes && bytes <= (1u << 20) && hle_kernel_va_mapped(base, bytes)) {
+            // (A snapshot's range was located in imported memory: mapped.)
+            if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) create_dev_buffer(scratch, kScratch, true);
                 if (scratch.map) {
                     if (scratch_next + bytes + 256 > kScratch) {
@@ -9288,8 +9289,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // The guest bytes, unless a copy-back's copy laid over them.
                     if (!whole && version == kCopyVersionNone && copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone)
                         note_copy_binding_locked(info, base);
-                    g_cb_realigned.fetch_add(1, std::memory_order_relaxed);
-                    g_cb_realigned_bytes.fetch_add(bytes, std::memory_order_relaxed);
+                    if (host_tooling()) {
+                        g_cb_realigned.fetch_add(1, std::memory_order_relaxed);
+                        g_cb_realigned_bytes.fetch_add(bytes, std::memory_order_relaxed);
+                    }
                 }
             }
             if (outcome == kBound) {
@@ -9336,7 +9339,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         }
         ++outcomes[outcome];
         infos.push_back(info);
-        if (++resolves % 200000 == 0) {
+        if (host_tooling() && ++resolves % 200000 == 0) {
             host_log("render: storage-buffer constants: %llu bound; page-table path: %llu no base, %llu unaligned, %llu not imported, %llu too long",
                      static_cast<unsigned long long>(outcomes[kBound]), static_cast<unsigned long long>(outcomes[kNoBase]),
                      static_cast<unsigned long long>(outcomes[kUnaligned]), static_cast<unsigned long long>(outcomes[kUnmapped]),
@@ -14623,7 +14626,7 @@ static bool draw_impl(const GpuDraw& d) {
     // Drivers finalise a pipeline's ISA on first use, so a pathological
     // translated shader shows up as a hang in vkCmdBindPipeline rather than in
     // pipeline creation. Name it before binding so a hung log says which.
-    if (!bind_pl->bound_once) {
+    if (!bind_pl->bound_once && host_tooling()) {
         bind_pl->bound_once = true;
         const std::string bind_note = bind_pl == &pl ? std::string()
                                                      : std::string(", no fallback") + (bind_pl->vs.lifted ? ", lifted VS" : "") +
@@ -15190,7 +15193,8 @@ static bool draw_impl(const GpuDraw& d) {
         g_order_logs.fetch_add(1);
         host_log("order: DRAW 0x%llx %s n=%u", static_cast<unsigned long long>(g_order_target), pl.name.c_str(), d.index_count);
     }
-    {
+    // The recent-draw ring (gpu_internal.h): tooling, and the glitch hunt's.
+    if (host_tooling() || glitch_on()) {
         DrawRec& r = g_draw_recs[g_draw_rec_next++ % kDrawRecs];
         const std::size_t name_len = std::min<std::size_t>(pl.name.size(), sizeof(r.name) - 1);  // no snprintf: every draw
         std::memcpy(r.name, pl.name.data(), name_len);

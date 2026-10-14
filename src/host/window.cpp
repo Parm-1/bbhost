@@ -1229,7 +1229,7 @@ bool vk_present() {
     }
     ps.on_arrival += flip.on_arrival;
     ps.cpu_ns += host_thread_cpu_ns() - cpu_enter;
-    if (++presents % 300 == 0) {
+    if (++presents % 300 == 0 && host_tooling()) {
         const auto now = std::chrono::steady_clock::now();
         host_log("present: 300 frames in %lld ms (display wait %llu ms, work %llu ms: submit queued work %llu, lock wait %llu, blit %llu, "
                  "queue submit %llu, present %llu), %llu dropped so far",
@@ -2500,7 +2500,7 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
     if (g_active) {
         std::lock_guard<std::mutex> lk(g_present_mu);
         if (!g_present_thread.joinable()) g_present_thread = std::thread(present_thread_main);
-        if (g_present_next.has && g_present_dropped.fetch_add(1) % 300 == 0) {
+        if (g_present_next.has && g_present_dropped.fetch_add(1) % 300 == 0 && host_tooling()) {
             host_log("present: display behind the game; dropped %llu frames so far",
                      static_cast<unsigned long long>(g_present_dropped.load()));
         }

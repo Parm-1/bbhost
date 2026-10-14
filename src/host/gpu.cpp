@@ -5694,7 +5694,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     const std::string& name = cc->name;
     const std::uint64_t code_hash = cc->hash;
     stamp.to(kDpProgram);
-    {
+    if (host_tooling()) {
         g_dispatch_shaders.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         ++g_dispatch_census[name];
