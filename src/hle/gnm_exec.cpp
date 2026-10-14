@@ -162,6 +162,7 @@ void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, 
 }
 
 void bind_gds_counters(GpuDispatch& d);
+void note_gpu_args(std::uint64_t va, std::size_t bytes);
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
     GpuDispatch d;
@@ -177,6 +178,7 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     d.dim[1] = y;
     d.dim[2] = z;
     d.indirect_va = indirect_va;
+    note_gpu_args(indirect_va, 12);
     d.depth_clear = t_regs.ctx[0x0B];
     d.stencil_clear = t_regs.ctx[0x0A];
     // A dispatch token in shadow mode: this packet is the dispatch it described.
@@ -231,6 +233,7 @@ void native_draw(const GpuDrawInputs* in, const char* kind) {
         // indirect ({count, instances, first index, base vertex, first
         // instance} for an indexed draw, {count, instances, first vertex,
         // first instance} otherwise).
+        note_gpu_args(o->indirect_va, o->indexed ? 20 : 16);
         if (!hle_kernel_va_mapped(o->indirect_va, o->indexed ? 20 : 16)) {
             g_draw_failed.fetch_add(1);
             return;
@@ -306,6 +309,7 @@ void trace_draw(const char* kind, std::uint32_t count, std::uint64_t index_va, s
         d.index_va = index_va;
         d.index_type = t_index_type & 1;
         d.indirect_va = indirect_va;
+        note_gpu_args(indirect_va, 20);
         // Rendering from GX takes the geometry from the call;
         // an index buffer the call cannot place keeps the packet's address.
         const GxDrawObjects* o = d.gx_render ? d.gx_objects : nullptr;
@@ -1030,6 +1034,24 @@ void note_counter_word(std::uint64_t word) {
     if (g_counter_words.size() < 65536 && g_counter_words.insert(word).second) g_any_counter_words.store(true, std::memory_order_relaxed);
 }
 
+// Memory the GPU reads when it runs the work, not when the command processor
+// walks it: an indirect draw's or dispatch's arguments, and memory a
+// counter is copied into on the GPU's timeline. A DMA fill or copy over it
+// later in the stream then goes on the GPU's timeline too (kDmaData), in
+// order with what reads it. Done at once on the CP, it landed up to a slot
+// ring before the GPU had read the earlier frame's counts: GPU particles
+// drawn with the next frame's arguments, or none - effects flickering while
+// the GPU was behind (Kyo, 2026-10-14). A small per-thread memo keeps an
+// address seen once from taking the registry's lock every draw.
+void note_gpu_args(std::uint64_t va, std::size_t bytes) {
+    if (!va || !host_gpu_gds_counters()) return;
+    thread_local std::uint64_t seen[256] = {};
+    std::uint64_t& memo = seen[(va >> 2) & 255];
+    if (memo == va) return;
+    memo = va;
+    for (std::size_t k = 0; k < bytes; k += 4) note_counter_word(va + k);
+}
+
 bool covers_counter_word(std::uint64_t va, std::size_t bytes) {
     if (!g_any_counter_words.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> lk(g_counter_words_mu);
@@ -1429,6 +1451,9 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     const bool ok = src_sel == 2 ? host_gpu_counter_fill(dst, b[1], bytes) : host_gpu_counter_copy(dst, gpu_va(b[1], b[2]), bytes);
                     if (ok) {
                         (src_sel == 2 ? g_counter_writes : g_counter_reads).fetch_add(1, std::memory_order_relaxed);
+                        // A count copied out (CopyStructureCount into a draw's
+                        // arguments): its destination now holds a GPU value too.
+                        if (src_sel != 2) note_gpu_args(dst, bytes < 64 ? bytes : 64);
                         break;
                     }
                     static std::atomic<int> logs{0};
@@ -1828,6 +1853,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     g_dispatches.fetch_add(1);
                     GpuDispatch dd = *dp;
                     if (dd.indirect_va) {
+                        note_gpu_args(dd.indirect_va, 12);
                         if (!hle_kernel_va_mapped(dd.indirect_va, 12)) break;
                         const auto* a = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(dd.indirect_va));
                         dd.dim[0] = a[0];

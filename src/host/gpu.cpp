@@ -4208,17 +4208,17 @@ void note_indirect_locked(std::uint64_t args_va, int kind, bool counting) {
 // recorded reads what retiring that slot frees: the game's display image, the
 // slot's descriptor sets. It waits on the GPU only for the game's submissions
 // up to its frame, which the slot's fence says are done, so it has run or is
-// about to: a short wait, bounded for a submit that never went in.
+// about to: a short wait, bounded (5 s) for a submit that never went in.
 void present_reads_wait(std::uint64_t target) {
     if (!g.present_timeline || g_device_lost.load(std::memory_order_relaxed)) return;
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.present_timeline;
     wi.pValues = &target;
-    if (vkWaitSemaphores(g.device, &wi, 200'000'000ull) == VK_TIMEOUT) {
+    if (vkWaitSemaphores(g.device, &wi, 5'000'000'000ull) == VK_TIMEOUT) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4)
-            host_log("gpu: the presenter's copy %llu not done 200 ms after its frame; its slot retires anyway",
+            host_log("gpu: the presenter's copy %llu not done 5 s after its frame; its slot retires anyway",
                      static_cast<unsigned long long>(target));
     }
 }
