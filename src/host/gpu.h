@@ -601,6 +601,8 @@ std::uint64_t host_gpu_draw_mark();
 // and how many have (~0 with no GPU to wait for).
 std::uint64_t host_gpu_work_needs();
 std::uint64_t host_gpu_submissions_completed();
+// The GPU's PCI vendor (0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel); 0 before the device is made.
+std::uint32_t host_gpu_vendor_id();
 // Sleeps until `need` submissions have finished (the timeline semaphore) or
 // `timeout_ns` passed: true when they have. False at once without a timeline
 // (the caller polls host_gpu_submissions_completed as before).

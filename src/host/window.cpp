@@ -344,6 +344,23 @@ const bool g_acquire_fence = !present_env_off("BBHOST_PRESENT_ACQUIRE_FENCE");
 // 180 Hz display a present, ~94 frames shown a second of the ~187 the game
 // made (Kyo's log, 2026-10-14).
 const bool g_present_own_queue = !present_env_off("BBHOST_PRESENT_OWN_QUEUE");
+// ... except on NVIDIA unless BBHOST_PRESENT_OWN_QUEUE=1: with it, a friend's
+// RTX 5080 (Windows driver 617.14) hung at the title in five runs of five -
+// the command processor waiting for the presenter's copy (present_reads_wait)
+// while the presenter sat in the driver's present and every other thread,
+// the window's included, queued on the driver's own lock (2026-10-14). The
+// renderer's stream carries the copy there, as before 2026-10-14. Known once
+// the device is made; 0 (not yet) is not remembered.
+bool present_own_queue_on() {
+    static int on = -1;
+    if (on >= 0) return on != 0;
+    if (!g_present_own_queue) return false;
+    const std::uint32_t vendor = host_gpu_vendor_id();
+    if (!vendor) return true;
+    const char* e = std::getenv("BBHOST_PRESENT_OWN_QUEUE");
+    on = (e && e[0] == '1') || vendor != 0x10de ? 1 : 0;
+    return on != 0;
+}
 // BBHOST_PRESENT_SUBMIT=1: before its blit the presenter submits whatever the
 // renderer is recording, as it did on every frame. The frame it shows is
 // normally submitted already (the command processor submits each job before
@@ -681,8 +698,10 @@ bool vk_start() {
     host_log("present: the acquire %s; the renderer's recording submitted %s; the copy %s; the present %s",
              g_acquire_fence && g_vk.acquire_fence ? "waited for on this thread (a fence)" : "waited for on the GPU queue (a semaphore)",
              g_present_submit_always ? "before every blit" : "only when the flip's frame is still in it",
-             g_present_own_queue && g_vk.present_queue && host_gpu_timeline() && host_gpu_present_timeline()
+             present_own_queue_on() && g_vk.present_queue && host_gpu_timeline() && host_gpu_present_timeline()
                  ? "on the presenter's own queue after its frame alone (BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
+             : g_present_own_queue && host_gpu_vendor_id() == 0x10de
+                 ? "behind the game's queued work (NVIDIA: BBHOST_PRESENT_OWN_QUEUE=1 for its own queue)"
                  : "behind the game's queued work",
              g_vk.gpu_wait ? "after the frame is done on the GPU (a sleeping wait)" : "at once (the driver waits for the frame)");
     return true;
@@ -1103,7 +1122,7 @@ bool vk_present() {
     const VkSemaphore game_tl = static_cast<VkSemaphore>(host_gpu_timeline());
     const VkSemaphore present_tl = static_cast<VkSemaphore>(host_gpu_present_timeline());
     const bool own_queue =
-        g_present_own_queue && by_fence && g_vk.present_queue && game_tl && present_tl && flip.submit_need != ~0ull;
+        present_own_queue_on() && by_fence && g_vk.present_queue && game_tl && present_tl && flip.submit_need != ~0ull;
     std::uint64_t ticket = 0;
     if (own_queue) {
         const std::uint64_t value = ++g_vk.present_value;
