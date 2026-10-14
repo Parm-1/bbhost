@@ -508,6 +508,18 @@ void host_gpu_queue_unlock();
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence);
 void host_gpu_queue_lock_only();  // the queue's mutex without waiting for the thread (after host_gpu_wait_submitted)
 void host_gpu_wait_submitted(std::uint64_t ticket);
+// The presenter's own queue (host/window.cpp, BBHOST_PRESENT_OWN_QUEUE): its
+// copy of a frame goes on the second queue and waits there for the game's
+// submissions up to that frame on `host_gpu_timeline()` (the VkSemaphore the
+// game's submissions signal, serial + 1 each; null without one) - not behind
+// everything the game queued since. It signals `host_gpu_present_timeline()`
+// (null without one) with the value it registered, under the renderer's lock,
+// with host_gpu_present_reads_locked: the slot being recorded then does not
+// retire - free the images and descriptor sets the copy may read - before
+// that value is reached.
+void* host_gpu_timeline();
+void* host_gpu_present_timeline();
+void host_gpu_present_reads_locked(std::uint64_t target);
 // How busy the GPU is with our work (gpu_busy.cpp): the union of the time
 // our command buffers - the game's and the presenter's - spent on the GPU,
 // from a timestamp at each one's start and end. Windows' per-process GPU
