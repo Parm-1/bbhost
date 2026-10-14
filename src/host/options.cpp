@@ -311,16 +311,20 @@ const Row kAllRows[] = {
     {Row::Close, "Close"},
 };
 constexpr int kRowCount = static_cast<int>(sizeof(kAllRows) / sizeof(kAllRows[0]));
-// The rows shown: kAllRows, less the GRAPHICS section while the PC graphics
-// settings are off (host_pc_graphics, the default). Built once.
+// The graphics settings that scale an area's blended values on every view
+// (engine/graphics_patch.cpp): shown and applied only with host_pc_graphics().
+bool per_view_setting(int id) {
+    return id == kBloom || id == kVignette || id == kShadowDistance || id == kAoStrength || id == kSaturation || id == kFog;
+}
+// The rows shown: kAllRows, less the per-view graphics rows while the PC
+// graphics settings are off (host_pc_graphics, the default). Built once.
 Row g_rows[kRowCount];
 int g_row_n = 0;
 void rows_init() {
     if (g_row_n) return;
-    bool skip = false;
     for (const Row& r : kAllRows) {
-        if (r.kind == Row::Header) skip = !host_pc_graphics() && std::strcmp(r.text, "GRAPHICS") == 0;
-        if (!skip) g_rows[g_row_n++] = r;
+        if (r.kind == Row::Option && !host_pc_graphics() && per_view_setting(r.setting)) continue;
+        g_rows[g_row_n++] = r;
     }
 }
 
@@ -776,22 +780,17 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
-    // The PC graphics settings off (the default): the game's own look, whatever
-    // the file says - every value one bbhost leaves alone (HostSettings' own).
+    // The PC graphics settings off (the default): the per-view ones are the
+    // area's own, whatever the file says (HostSettings' own values). The rest
+    // are written once at their source and again only when they change.
     if (!host_pc_graphics()) {
         const HostSettings game;
-        h.ssao = game.ssao;
-        h.motion_blur = game.motion_blur;
-        h.anti_alias = game.anti_alias;
-        h.depth_of_field = game.depth_of_field;
-        h.chromatic_aberration = game.chromatic_aberration;
         h.vignette = game.vignette;
         h.bloom = game.bloom;
         h.saturation = game.saturation;
         h.fog = game.fog;
         h.ao_strength = game.ao_strength;
         h.shadow_scale = game.shadow_scale;
-        h.lod_bias = game.lod_bias;
     }
     h.skip_logos = on_of(kSkipLogos);
     h.debug_menu = on_of(kDebugMenu);
@@ -1380,10 +1379,10 @@ void options_panel_frame(float display_w, float display_h) {
 }
 }  // namespace
 
-// The PC graphics settings (F10's GRAPHICS, the in-game PC Graphics and PC
-// Effects): off unless BBHOST_PC_GRAPHICS=1 or [video] pc_graphics = true.
-// Off, bbhost leaves the game's look alone - nothing installed for them,
-// nothing written, the debug menu's own switches (LodLvBias...) in charge.
+// The graphics settings that scale an area's blended values on every view -
+// bloom, vignette, saturation, fog, AO strength, shadow distance: off unless
+// BBHOST_PC_GRAPHICS=1 or [video] pc_graphics = true. Off, their rows are not
+// shown and nothing of theirs is installed or run in a frame.
 bool host_pc_graphics() {
     static const bool on = [] {
         if (const char* e = std::getenv("BBHOST_PC_GRAPHICS"); e && *e) return e[0] == '1';
@@ -1394,8 +1393,19 @@ bool host_pc_graphics() {
 }
 
 HostSettings host_settings() {
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    return g_settings;
+    // A copy per thread, made again only when the settings have changed: the
+    // FPS counter, the pointer and every pad read ask each frame, and a lock
+    // and a copy each time were work for nothing. Keyed by the serial the
+    // copy was built at (HostSettings::serial), which trails host_opt_serial()
+    // while a change is being made, so a copy taken then is taken again.
+    thread_local HostSettings copy;
+    thread_local bool have = false;
+    if (!have || copy.serial != host_opt_serial()) {
+        std::lock_guard<std::mutex> lk(g_settings_mu);
+        copy = g_settings;
+        have = true;
+    }
+    return copy;
 }
 
 namespace {

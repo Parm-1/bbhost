@@ -780,16 +780,21 @@ GUEST_ABI void pc_graphics_handler(void* dialog, void* params) {
     for (auto& t : g_graphics) {
         add_toggle_row(dialog, &t.value, t.id, default_of(t));
     }
-    add_slider_row(dialog, &g_gfx_ao.value, g_gfx_ao.id, default_of(g_gfx_ao));
-    add_slider_row(dialog, &g_gfx_shadow.value, g_gfx_shadow.id, default_of(g_gfx_shadow));
-    add_slider_row(dialog, &g_gfx_fog.value, g_gfx_fog.id, default_of(g_gfx_fog));
+    // The sliders scale the area's values every view: only with the PC
+    // graphics settings on (host_pc_graphics).
+    const bool per_view = host_pc_graphics();
+    if (per_view) {
+        add_slider_row(dialog, &g_gfx_ao.value, g_gfx_ao.id, default_of(g_gfx_ao));
+        add_slider_row(dialog, &g_gfx_shadow.value, g_gfx_shadow.id, default_of(g_gfx_shadow));
+        add_slider_row(dialog, &g_gfx_fog.value, g_gfx_fog.id, default_of(g_gfx_fog));
+    }
     // The pick list **last**, for the same reason the frame cap is last in the
     // other section: it is translucent and opens directly under the row that
     // owns it, so anywhere else its entries sit over the rows below and their
     // values read through the panel.
     add_list_row(dialog, &g_resolution, kGfxResolution, kResolutions,
                  static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])), host_opt_default_resolution_index());
-    log_rows("PCGraphics", dialog, kGraphicsRows, kGraphicsRows);
+    log_rows("PCGraphics", dialog, per_view ? kGraphicsRows : kGraphicsCount + 1, kGraphicsRows);
 }
 
 // PC Effects: four toggles and two sliders. No pick list, so nothing opens
@@ -801,12 +806,19 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     for (auto& t : g_effects) seed(t);
     seed(g_fx_bloom);
     seed(g_fx_saturation);
-    for (auto& t : g_effects) {
-        add_toggle_row(dialog, &t.value, t.id, default_of(t));
+    // Vignette, bloom and saturation scale the area's values every view: only
+    // with the PC graphics settings on (host_pc_graphics). Vignette is last of
+    // the toggles.
+    const bool per_view = host_pc_graphics();
+    const int toggles = per_view ? kEffectsCount : kEffectsCount - 1;
+    for (int i = 0; i < toggles; ++i) {
+        add_toggle_row(dialog, &g_effects[i].value, g_effects[i].id, default_of(g_effects[i]));
     }
-    add_slider_row(dialog, &g_fx_bloom.value, g_fx_bloom.id, default_of(g_fx_bloom));
-    add_slider_row(dialog, &g_fx_saturation.value, g_fx_saturation.id, default_of(g_fx_saturation));
-    log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
+    if (per_view) {
+        add_slider_row(dialog, &g_fx_bloom.value, g_fx_bloom.id, default_of(g_fx_bloom));
+        add_slider_row(dialog, &g_fx_saturation.value, g_fx_saturation.id, default_of(g_fx_saturation));
+    }
+    log_rows("PCEffects", dialog, per_view ? kEffectsRows : toggles, kEffectsRows);
 }
 
 // PC Controls: the mouse camera, how fast it turns and which way, and the
@@ -1459,7 +1471,8 @@ GUEST_ABI std::int64_t pc_open_section(void* root, void* params) {
 }
 GUEST_ABI std::int64_t pc_open_graphics(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_graphics_handler));
-    return open_named(root, params, kOurGraphicsName, handler, kGraphicsRows - 1);  // the resolution
+    // The resolution, last: after the sliders when they are shown.
+    return open_named(root, params, kOurGraphicsName, handler, host_pc_graphics() ? kGraphicsRows - 1 : kGraphicsCount);
 }
 GUEST_ABI std::int64_t pc_open_effects(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_effects_handler));
@@ -1618,8 +1631,6 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
     // lines and **scrolls**, with the scroll bar the port's movie gives it, so
     // rows past the fifth need no slot of their own.
     for (const auto& r : rows) {
-        const auto id = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(r[0]));
-        if (!host_pc_graphics() && (id == kSystemGraphicsRowId || id == kSystemEffectsRowId)) continue;  // host/settings.h
         Captions c(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(r[0])));
         GuestFunction f(kRowFunctorVTable, r[1]);
         hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow), builder, c.buf, f.buf, &flag);
