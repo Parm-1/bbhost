@@ -180,6 +180,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool check_updates = cfg.update_check == 1;
 #endif
     bool show_every_start = cfg.setup_always;
+    bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
     bool fullscreen = host_opt_index("window_mode") == 1;
@@ -301,6 +302,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         e.push_back({"update", "check", check_updates ? "true" : "false"});
         if (!f[kToken].str().empty()) e.push_back({"update", "token_file", toml_string(saved_path(f[kToken].str()))});
         e.push_back({"startup", "setup_window", show_every_start ? "true" : "false"});
+        e.push_back({"debug", "tooling", tooling ? "true" : "false"});
         // What this bbhost's file looks like (core/config.h): a value saved
         // from here is a choice.
         e.push_back({"bbhost", "config_version", std::to_string(kUserConfigVersion)});
@@ -635,6 +637,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");
+
+        ImGui::SeparatorText("Diagnostics");
+        ImGui::Checkbox("Tooling and logging", &tooling);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("The periodic reports in the log, the stall detector, the GPU busy meter (GPU %% beside the FPS counter) "
+                            "and the recent-draw history. Off gives the game that headroom; the log keeps the start, warnings and "
+                            "errors. Leave it on when reporting a problem.");
+        ImGui::PopTextWrapPos();
 
         ImGui::SeparatorText("Updates");
         ImGui::Checkbox("Check for a newer bbhost at start", &check_updates);

@@ -420,7 +420,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         const char* e = std::getenv("BBHOST_STALL_MS");
         return e ? std::strtoull(e, nullptr, 10) : 100ull;
     }();
-    if (stall_ms) {
+    if (stall_ms && host_tooling()) {
         static std::mutex stall_mu;
         std::lock_guard<std::mutex> stall_lock(stall_mu);
         const auto t = std::chrono::steady_clock::now();
@@ -472,7 +472,11 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         prev_hash_us = hash_us;
         prev_repl = repl;
     }
-    if (n < 8 || (n % 300) == 0) {
+    // With tooling off only what the report also did for the game: the
+    // pipeline cache written when it has grown.
+    if (!host_tooling()) {
+        if (n % 300 == 0) host_gpu_save_pipeline_cache();
+    } else if (n < 8 || (n % 300) == 0) {
         static GpuStats last{};
         static auto last_t = std::chrono::steady_clock::now();
         const GpuStats now = host_gpu_stats();

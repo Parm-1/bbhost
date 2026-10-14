@@ -1089,7 +1089,7 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
             if (n == 0) {
                 host_log("video: a loading screen's or an uncapped flip waits for its frame on the GPU (BBHOST_FLIP_AFTER_GPU=0 "
                          "completes it on recording)");
-            } else if (g_flip_uncapped.load() && (n + 1) % 36000 == 0) {
+            } else if (g_flip_uncapped.load() && (n + 1) % 36000 == 0 && host_tooling()) {
                 host_log("video: %llu of %llu uncapped and loading-screen flips waited for their frame, the longest %.1f ms",
                          static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(g_holds.flips.load()),
                          g_holds.longest_ns.load() / 1e6);

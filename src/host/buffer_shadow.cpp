@@ -775,46 +775,86 @@ void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::
 // the newest went into. render.cpp copies a constant buffer as its draw is
 // recorded only when no GPU write to its memory is still to land
 // (gpu_writes_pending_locked); landed pages leave the table as it grows.
-// A small write - a label, a counter, ~280 a frame - goes by 64-byte line: by
-// page, every label's page (the game keeps them beside its constants) read as
-// GPU-written for good, and its constants were never copied.
+// Asked at every constant buffer a draw binds (~3,400 a frame), so both are
+// flat tables - open addressing, one probe as a rule: the std::map of lines
+// and the node map of pages they replace cost the command processor 0.6 ms a
+// frame, the frame rate wherever it rather than the GPU set the pace (Kyo,
+// 2026-10-14: "it feels like we're heavily cpubound"). A small write - a
+// label or a counter, ~280 a frame - goes by 4 KiB page: by 64 KiB, each
+// label's page (beside the game's constants) read as GPU-written for good.
 namespace {
-constexpr unsigned kLineShift = 6;
+constexpr unsigned kSmallShift = 12;
 constexpr std::uint64_t kSmallWrite = 256;
-std::unordered_map<std::uint64_t, std::uint64_t> g_gpu_write_pages;
-std::map<std::uint64_t, std::uint64_t> g_gpu_write_lines;
-std::uint64_t g_gpu_write_notes = 0;
+
+// Page number -> the newest recording a GPU write to it went into. Rebuilt
+// with only the writes still to land when it is half full.
+class PageSerials {
+public:
+    void note(std::uint64_t page, std::uint64_t serial) {
+        if ((used_ + 1) * 2 > slots_.size()) rebuild();
+        Slot& s = slots_[find(page + 1)];
+        if (!s.key) {
+            s.key = page + 1;  // 0: an empty slot
+            ++used_;
+        }
+        if (serial > s.serial) s.serial = serial;
+    }
+    bool pending(std::uint64_t page) const {
+        if (!used_) return false;
+        const Slot& s = slots_[find(page + 1)];
+        return s.key && s.serial >= g.completed_submits;
+    }
+
+private:
+    struct Slot {
+        std::uint64_t key = 0, serial = 0;
+    };
+    std::vector<Slot> slots_;
+    std::size_t used_ = 0;
+    unsigned bits_ = 10;
+    std::size_t find(std::uint64_t key) const {
+        const std::size_t mask = slots_.size() - 1;
+        std::size_t i = static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> (64 - bits_));
+        while (slots_[i].key && slots_[i].key != key) i = (i + 1) & mask;
+        return i;
+    }
+    void rebuild() {
+        std::vector<Slot> old;
+        old.swap(slots_);
+        std::size_t keep = 0;
+        for (const Slot& s : old) keep += s.key && s.serial >= g.completed_submits;
+        while ((keep + 1) * 4 > (std::size_t{1} << bits_)) ++bits_;
+        slots_.assign(std::size_t{1} << bits_, Slot{});
+        used_ = 0;
+        for (const Slot& s : old) {
+            if (!s.key || s.serial < g.completed_submits) continue;
+            slots_[find(s.key)] = s;
+            ++used_;
+        }
+    }
+};
+PageSerials g_gpu_write_pages, g_gpu_write_small;
 }  // namespace
 
 void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!bytes) return;
     const std::uint64_t serial = g.flushes;  // the recording under way
     if (bytes <= kSmallWrite) {
-        for (std::uint64_t l = va >> kLineShift; l <= (va + bytes - 1) >> kLineShift; ++l) g_gpu_write_lines[l] = serial;
-    } else {
-        const std::uint64_t first = va >> kPageShift, last = (va + bytes - 1) >> kPageShift;
-        if (last - first > (1u << 16)) return;  // 4 GiB: not a write anything makes
-        for (std::uint64_t p = first; p <= last; ++p) g_gpu_write_pages[p] = serial;
+        for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) g_gpu_write_small.note(p, serial);
+        return;
     }
-    if (++g_gpu_write_notes % 4096 == 0) {  // landed writes leave
-        for (auto it = g_gpu_write_pages.begin(); it != g_gpu_write_pages.end();)
-            it = it->second < g.completed_submits ? g_gpu_write_pages.erase(it) : std::next(it);
-        for (auto it = g_gpu_write_lines.begin(); it != g_gpu_write_lines.end();)
-            it = it->second < g.completed_submits ? g_gpu_write_lines.erase(it) : std::next(it);
-    }
+    const std::uint64_t first = va >> kPageShift, last = (va + bytes - 1) >> kPageShift;
+    if (last - first > (1u << 16)) return;  // 4 GiB: not a write anything makes
+    for (std::uint64_t p = first; p <= last; ++p) g_gpu_write_pages.note(p, serial);
 }
 
 bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!bytes) return false;
-    if (!g_gpu_write_pages.empty()) {
-        for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
-            const auto it = g_gpu_write_pages.find(p);
-            if (it != g_gpu_write_pages.end() && it->second >= g.completed_submits) return true;
-        }
+    for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
+        if (g_gpu_write_pages.pending(p)) return true;
     }
-    const std::uint64_t last = (va + bytes - 1) >> kLineShift;
-    for (auto it = g_gpu_write_lines.lower_bound(va >> kLineShift); it != g_gpu_write_lines.end() && it->first <= last; ++it) {
-        if (it->second >= g.completed_submits) return true;
+    for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) {
+        if (g_gpu_write_small.pending(p)) return true;
     }
     return false;
 }
