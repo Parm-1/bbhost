@@ -852,38 +852,59 @@ std::uint32_t g_tile_fixed[2] = {0, 0};             // BBHOST_LIGHT_GRID=WxH: th
 // and GPU-bound, Model detail Normal, 45 s each: one tile 160.2 fps, 4 a side
 // 159.2, the game's own 128x128 tiles in 3x3 jobs (BBHOST_LIGHT_GRID=0) 165.1.
 std::uint32_t g_tiles_per_axis = 1;
-std::uint64_t g_tile_from = 0;
+// The tile is the GraphicsManager's own, written once by its constructor
+// (sub_26958d0: mov dword [rbx+0x78a8], 128 at 0x2695cb6 and [rbx+0x78ac] at
+// 0x2695cc0 - Kyo's "REAL LightGrid 1080p" puts 1920 and 1080 there) and
+// never by the game again, so bbhost sets it the same way: the constructor's
+// immediates at install, the live manager's two words only when the window's
+// or display's size changes (light_grid_window, told by the window on a
+// resize or fullscreen toggle). Nothing for it runs in a frame.
+constexpr std::uint64_t kTileCtorW = 0x2695cb6, kTileCtorH = 0x2695cc0;  // 10 bytes each, the imm32 at +6
+constexpr std::uint8_t kTileCtorWas[2][10] = {{0xc7, 0x83, 0xa8, 0x78, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00},
+                                              {0xc7, 0x83, 0xac, 0x78, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00}};
+GuestMemory g_tile_mem{};
+std::uint64_t g_tile_ctor[2] = {0, 0};  // the immediates' addresses, slid (0: not ours to write)
+std::mutex g_tile_mu;
 bool g_task_steal = false;                          // BBHOST_TASK_TUNE=s (task_tune_install, below)                      // BBHOST_LIGHT_GRID_FROM=flip: the game's tiles before it (A/B in one run)
 
-void light_grid_tick() {
-    if (!g_graphics_manager) return;
-    if (g_tile_from && hle_video_flip_count() < g_tile_from) return;
-    const std::uint64_t gm = *g_graphics_manager;
-    if (!gm) return;
-    if (g_task_steal) *reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(gm + 0x78bd)) = 1;
-    int ww = 0, wh = 0;
-    host_window_pixels(&ww, &wh);
-
-    // The grid follows the window - the presented image, or the display in
-    // fullscreen - not the render size: a 2560x1440 picture shown in a
-    // 1920x1080 window bins against 1920x1080's grid. Headless (no window),
-    // the render size.
+// The tile for a frame of fw x fh (the window, the display in fullscreen, or
+// the render size headless): the frame over the tiles a side, or a fixed
+// tile (BBHOST_LIGHT_GRID=WxH). Written into the constructor's immediates and
+// the live manager, under g_tile_mu; nothing happens when they hold it already.
+void light_grid_apply(std::uint32_t fw, std::uint32_t fh) {
+    if (!fw || !fh) return;
     const std::uint32_t tiles = g_tiles_per_axis;
-    const std::uint32_t fw = ww > 0 ? static_cast<std::uint32_t>(ww) : g_res_words[0];
-    const std::uint32_t fh = wh > 0 ? static_cast<std::uint32_t>(wh) : g_res_words[1];
     std::uint32_t tw = std::clamp<std::uint32_t>((fw + tiles - 1) / tiles, 128u, 16384u);
     std::uint32_t th = std::clamp<std::uint32_t>((fh + tiles - 1) / tiles, 128u, 16384u);
     if (g_tile_fixed[0]) {
         tw = std::clamp<std::uint32_t>(g_tile_fixed[0], 16u, 16384u);
         th = std::clamp<std::uint32_t>(g_tile_fixed[1], 16u, 16384u);
     }
+    const std::uint32_t want[2] = {tw, th};
+    for (int k = 0; k < 2; ++k) {
+        if (!g_tile_ctor[k]) continue;
+        auto* imm = static_cast<std::uint32_t*>(guest_ptr(g_tile_mem, g_tile_ctor[k] + 6));
+        if (*imm == want[k]) continue;
+        const std::uint64_t page = g_tile_ctor[k] & ~0xfffull;
+        if (!guest_protect_rwx(&g_tile_mem, page, 0x2000)) continue;
+        std::memcpy(imm, &want[k], 4);
+        guest_protect_rx(&g_tile_mem, page, 0x2000);
+    }
+    const std::uint64_t gm = g_graphics_manager ? *g_graphics_manager : 0;
+    if (!gm) return;  // not made yet: its constructor writes the size
     auto* tile = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(gm + kLightTileW));
     if (tile[0] == tw && tile[1] == th) return;
     static std::atomic<int> logs{0};
-    if (logs.fetch_add(1) < 8) host_log("graphics: light grid tile %ux%u -> %ux%u (window %dx%d, render %ux%u)", tile[0], tile[1], tw, th, ww, wh, g_res_words[0], g_res_words[1]);
+    if (logs.fetch_add(1) < 8) host_log("graphics: light grid tile %ux%u -> %ux%u (a %ux%u frame)", tile[0], tile[1], tw, th, fw, fh);
     tile[0] = tw;
     tile[1] = th;
     static_assert(kLightTileH == kLightTileW + 4, "the tile's height follows its width");
+}
+
+// The window's pixel size, now and whenever it changes (host_window_on_pixels).
+void light_grid_window(int w, int h) {
+    std::lock_guard<std::mutex> lock(g_tile_mu);
+    light_grid_apply(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
 }
 
 // Model detail. Every mesh draw (sub_216f9d0, 0x216fc09) picks its level as
@@ -899,11 +920,21 @@ void light_grid_tick() {
 constexpr std::uint64_t kRendManSlot = 0x5940298;
 const std::uint64_t* g_rend_man = nullptr;
 
+// Written when the setting changes (or the render manager's settings are
+// made again), not held every frame: the debug menu's LodLvBias changes it in
+// between and keeps it. Never with the PC graphics settings off - the game's
+// own and the debug menu's alone - unless BBHOST_LOD_BIAS asks.
 void lod_bias_tick() {
+    if (!g_lod_bias_env && !host_pc_graphics()) return;
     if (!g_rend_man || !*g_rend_man) return;
     const int want = g_lod_bias.load(std::memory_order_relaxed);
     const std::uint64_t settings = *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(*g_rend_man + 0x10));
     if (!settings) return;
+    static std::uint64_t applied_at = 0;
+    static int applied = 0;
+    if (settings == applied_at && want == applied) return;
+    applied_at = settings;
+    applied = want;
     auto* bias = reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(settings + 0x530));
     if (*bias == want) return;
     static std::atomic<int> logs{0};
@@ -945,7 +976,6 @@ void light_grid_install(ElfImage* image) {
         host_log("graphics: light grid as the game has it (BBHOST_LIGHT_GRID=0)");
         return;
     }
-    if (const char* e = std::getenv("BBHOST_LIGHT_GRID_FROM"); e && *e) g_tile_from = std::strtoull(e, nullptr, 10);
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "quarter") == 0) g_tiles_per_axis = 4;
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strchr(e, 'x')) {
         g_tile_fixed[0] = static_cast<std::uint32_t>(std::atoi(e));
@@ -966,7 +996,24 @@ void light_grid_install(ElfImage* image) {
     div[1] = 1;
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, at(0x55289f8)));  // res_width, res_height (below)
     g_graphics_manager = static_cast<const std::uint64_t*>(guest_ptr(image->mem, at(kGraphicsManagerSlot)));
-    host_log("graphics: light grid - one job of %ux%u tiles sized to the window (was 3x3 jobs of 128x128 tiles; BBHOST_LIGHT_GRID=quarter: 4x4, =0: the game's)",
+    g_tile_mem = image->mem;
+    const std::uint64_t ctor[2] = {at(kTileCtorW), at(kTileCtorH)};
+    for (int k = 0; k < 2; ++k) {
+        if (std::memcmp(guest_ptr(image->mem, ctor[k]), kTileCtorWas[k], sizeof(kTileCtorWas[k])) == 0) g_tile_ctor[k] = ctor[k];
+    }
+    if (!g_tile_ctor[0] || !g_tile_ctor[1]) {
+        host_log("graphics: the GraphicsManager constructor's 128x128 tile is not at 0x%llx/0x%llx; the size is written into the "
+                 "manager alone", static_cast<unsigned long long>(kTileCtorW), static_cast<unsigned long long>(kTileCtorH));
+        g_tile_ctor[0] = g_tile_ctor[1] = 0;
+    }
+    {
+        // The render size until the window says otherwise (headless, it stays).
+        std::lock_guard<std::mutex> lock(g_tile_mu);
+        light_grid_apply(g_res_words[0], g_res_words[1]);
+    }
+    host_window_on_pixels(&light_grid_window);
+    host_log("graphics: light grid - one job of %ux%u tiles sized to the window, set by the manager's constructor and again only "
+             "when the window's size changes (was 3x3 jobs of 128x128 tiles; BBHOST_LIGHT_GRID=quarter: 4x4, =0: the game's)",
              g_tiles_per_axis, g_tiles_per_axis);
 }
 
@@ -978,7 +1025,6 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     g_scene_view_flip.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     refresh_settings();
     camera_tick();
-    light_grid_tick();
     lod_bias_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
                     reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[0])));
@@ -1054,8 +1100,13 @@ void live_install(ElfImage* image) {
     lod_bias_install(image);
     task_tune_install(image);
     const auto at = [&](std::uint64_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
+    // The PC graphics settings off (host_pc_graphics, the default): nothing of
+    // theirs is installed - the game's own look, its own (and the debug
+    // menu's) switches in charge, nothing run for them in a frame.
+    const bool pc = host_pc_graphics();
     const std::uint64_t ca = at(kCaCopy);
-    if (std::memcmp(guest_ptr(image->mem, ca), kCaCopyBytes, sizeof(kCaCopyBytes)) != 0) {
+    if (!pc) {
+    } else if (std::memcmp(guest_ptr(image->mem, ca), kCaCopyBytes, sizeof(kCaCopyBytes)) != 0) {
         host_log("graphics: refused, 0x%llx is not chromatic aberration's copy; it stays on",
                  static_cast<unsigned long long>(kCaCopy));
     } else if (!install_ca_stub(image, ca)) {
@@ -1068,6 +1119,12 @@ void live_install(ElfImage* image) {
         host_log("graphics: refused, 0x%llx is not the render-view prologue (or no room for its hook); SSAO "
                  "and AA stay on",
                  static_cast<unsigned long long>(kRenderView));
+    }
+    if (!pc) {
+        host_log("graphics: the PC graphics settings are off - SSAO, anti-aliasing, depth of field, chromatic aberration, "
+                 "motion blur, bloom, vignette, saturation, fog, AO strength, shadow distance and model detail are the "
+                 "game's own (BBHOST_PC_GRAPHICS=1 or [video] pc_graphics = true turns them on)");
+        return;
     }
     if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
                                reinterpret_cast<void*>(&yebis_record_hook))) {
