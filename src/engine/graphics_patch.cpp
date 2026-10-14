@@ -89,6 +89,24 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<bool> g_ssao{true}, g_aa{true};
+// Bumped when the SSAO or AA setting changes: each renderer is given the
+// values once a generation (render_view_hook). 0: never changed - the game's.
+std::atomic<std::uint32_t> g_flags_gen{0};
+// The renderers given them, and the generation each was given (render_view_hook,
+// the render thread alone).
+struct GivenRenderer {
+    std::uint8_t* renderer;
+    std::uint32_t gen;
+};
+GivenRenderer g_given[16] = {};
+unsigned g_given_next = 0;
+// Scene contexts constructed since the last view (graphics_scene_context_made):
+// the constructor turns SSAO and AA on again, so one made where an earlier
+// one stood - a menu's context made on demand, freed and made again at the
+// same address - is given the settings again at its next view.
+std::mutex g_made_mu;
+std::vector<std::uint64_t> g_made;  // under g_made_mu
+std::atomic<bool> g_made_any{false};
 
 // ---- Draw parameters ---------------------------------------------------------
 //
@@ -259,16 +277,17 @@ void set_chromatic_aberration(bool on) {
     if (g_ca_mask->exchange(want) != want) host_log("graphics: chromatic aberration %s", on ? "on" : "off");
 }
 
+void* alloc_exec_near(std::uint64_t at);
+void free_exec_page(void* page);
+
 // The copy, through the mask. The stub has to be within a rel32 of the code,
-// so its page comes from the low 2 GiB.
+// so its page comes from near it (alloc_exec_near). On Windows there was no
+// such page here until 2026-10-14: the stub was never placed, every run said
+// "it stays on", and the setting did nothing (Kyo: "chromatic aberration
+// disable actually doesn't even currently work").
 bool install_ca_stub(ElfImage* image, std::uint64_t at) {
-#if defined(_WIN32)
-    (void)image;
-    (void)at;
-    return false;
-#else
-    void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-    if (page == MAP_FAILED) return false;
+    void* page = alloc_exec_near(at);
+    if (!page) return false;
     auto* c = static_cast<std::uint8_t*>(page);
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(c);
     const std::uint64_t back = at + sizeof(kCaCopyBytes);
@@ -291,7 +310,7 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     c[18] = 0xe9;
     if (!rel32(stub + 12, stub + kMaskAt, &to_mask) || !rel32(stub + 23, back, &to_back) ||
         !rel32(at + 5, stub, &to_stub)) {
-        munmap(page, 0x1000);
+        free_exec_page(page);
         return false;
     }
     std::memcpy(c + 8, &to_mask, 4);
@@ -302,7 +321,7 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     const std::uint64_t lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
         g_ca_mask = nullptr;
-        munmap(page, 0x1000);
+        free_exec_page(page);
         return false;
     }
     p[0] = 0xe9;  // jmp stub
@@ -310,7 +329,6 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     std::memset(p + 5, 0x90, sizeof(kCaCopyBytes) - 5);
     guest_protect_rx(&image->mem, lo, hi - lo);
     return true;
-#endif
 }
 
 std::atomic<bool> g_motion_blur{true};
@@ -318,32 +336,69 @@ std::atomic<int> g_lod_bias{0};  // the model detail bias to keep (lod_bias_tick
 bool g_lod_bias_env = false;     // BBHOST_LOD_BIAS set: the setting does not move it
 
 // Motion blur's velocity post-pass. Before YEBIS blurs, the scene renderer
-// runs sub_1264430 (its only caller, 0x26ab381, when the graphics manager's
-// +0x78b4 is set): two ping-pong passes over the velocity map into a
-// half-res pair (+0xcf8/+0xd50) that only the motion blur reads. With the
-// Motion Blur setting off the blur's shader is patched away
-// (host/shader_patch.cpp), so the pass is work nobody looks at, and is
-// skipped (the community "Disable Misc. Renders" removes the second target
-// for the same effect). The velocity map itself is still drawn: leaving it
-// out whites out the frame.
-constexpr std::uint64_t kVelocityPost = 0x1264430;
-// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x28
-constexpr std::uint8_t kVelocityPostPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
-                                                  0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
+// runs sub_1264430 (its only caller, 0x26ab381) when the graphics manager's
+// +0x78b4 is set (`cmp byte [r12+0x78b4], 0; je` at 0x26ab345): two
+// ping-pong passes over the velocity map into a half-res pair (+0xcf8/+0xd50)
+// that only the motion blur reads. With the Motion Blur setting off the
+// blur's shader is patched away (host/shader_patch.cpp), so the pass is work
+// nobody looks at. The switch is written at its source instead of the pass
+// being skipped by a hook on every call: the manager's constructor's
+// immediate (`mov byte [rbx+0x78b4], 1` at 0x2695ce6) and the live manager's
+// byte, once when the setting changes - the debug menu's "Enable VeloMap
+// Dilation" is the same byte and keeps it in between. The velocity map itself
+// is still drawn: leaving it out whites out the frame.
+constexpr std::uint64_t kVelocityCtor = 0x2695ce6;
+const std::uint8_t kVelocityCtorBytes[] = {0xc6, 0x83, 0xb4, 0x78, 0x00, 0x00, 0x01};
+constexpr std::size_t kVelocitySwitch = 0x78b4;
+std::uint8_t* g_velocity_ctor = nullptr;  // the constructor's immediate, when its bytes were the game's
+GuestMemory g_velocity_mem{};
+std::uint64_t g_velocity_slide = 0;
+constexpr std::uint64_t kGraphicsManagerOfBlur = 0x5940dd8;
 
-GUEST_ABI std::int64_t velocity_post_hook(std::uint64_t, const std::uint64_t*) {
-    return g_motion_blur.load(std::memory_order_relaxed) ? 0 : 1;  // nonzero: the call returns at once
+void motion_blur_apply(bool on) {
+    const std::uint8_t want = on ? 1 : 0;
+    if (g_velocity_ctor && *g_velocity_ctor != want) {
+        const std::uint64_t at = reinterpret_cast<std::uint64_t>(g_velocity_ctor);
+        if (guest_protect_rwx(&g_velocity_mem, at & ~0xfffull, 0x1000)) {
+            *g_velocity_ctor = want;
+            guest_protect_rx(&g_velocity_mem, at & ~0xfffull, 0x1000);
+        }
+    }
+    std::uint64_t gm = 0;
+    if (g_velocity_slide)
+        std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManagerOfBlur - kPreferredGuestSlide))), 8);
+    if (gm) *reinterpret_cast<volatile std::uint8_t*>(static_cast<std::uintptr_t>(gm + kVelocitySwitch)) = want;
+    host_log("graphics: motion blur %s (its velocity pass %s)", on ? "on" : "off", on ? "runs" : "skipped at the graphics manager's switch");
 }
 
 // The settings' listener (host_settings_listen, from live_install): told each
-// change once, on the thread that made it, it keeps the values the hooks
-// below apply - the hooks read these and never the settings, so a view costs
-// no settings lookup at all. What the hooks write they write every view, as
-// they must: the game derives those values again for each view (the area's
-// draw parameters), and a value applied once would last one view.
+// change once, on the thread that made it (the store calls its listeners one
+// at a time), it keeps the values the hooks below apply - the hooks read these
+// and never the settings, so a view costs no settings lookup at all. The
+// hooks that scale an area's blended values (bloom, vignette, saturation, fog,
+// AO strength, shadow distance) write every view, as they must: the game
+// derives those values again for each view (the area's draw parameters), and
+// a value applied once would last one view. SSAO and AA are given to each
+// renderer once a generation (render_view_hook) and motion blur's switch is
+// written once (motion_blur_apply), so the debug menu's switches over the same
+// bytes keep what they set in between.
 void settings_changed(const HostSettings& hs) {
-    g_ssao.store(hs.ssao);
-    g_aa.store(hs.anti_alias);
+    // SSAO and AA go to the renderers once each when they change - or at the
+    // first view when the file asks for other than the game's own
+    // (render_view_hook); never while they are the game's.
+    static bool ssao_was = true, aa_was = true;
+    if (hs.ssao != ssao_was || hs.anti_alias != aa_was) {
+        ssao_was = hs.ssao;
+        aa_was = hs.anti_alias;
+        g_ssao.store(hs.ssao);
+        g_aa.store(hs.anti_alias);
+        g_flags_gen.fetch_add(1, std::memory_order_release);
+    }
+    static bool blur_was = true;
+    if (hs.motion_blur != blur_was) {
+        blur_was = hs.motion_blur;
+        motion_blur_apply(hs.motion_blur);
+    }
     set_chromatic_aberration(hs.chromatic_aberration);
     g_bloom.store(hs.bloom);
     g_saturation.store(hs.saturation);
@@ -755,6 +810,14 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
     return 0;
 }
 
+void free_exec_page(void* page) {
+#if defined(_WIN32)
+    VirtualFree(page, 0, MEM_RELEASE);
+#else
+    munmap(page, 0x1000);
+#endif
+}
+
 // An executable page within a rel32 of `at`, for a stub a jump or call there
 // can reach. Null when none is free.
 void* alloc_exec_near(std::uint64_t at) {
@@ -986,24 +1049,31 @@ void light_grid_install(ElfImage* image) {
         g_tile_fixed[1] = static_cast<std::uint32_t>(std::atoi(std::strchr(e, 'x') + 1));
     }
     const auto at = [&](std::uint64_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
+    // The game's 3x3, or 1x1 already: a patch list's (Performance Patch v3
+    // writes the split and a 1920x1080 tile, and with it applied this
+    // refused, so the tile never followed the window - Kyo's log, 2026-10-14).
     auto* div = static_cast<std::uint32_t*>(guest_ptr(image->mem, at(kLightGridDiv)));
-    if (div[0] != 3 || div[1] != 3) {
+    const bool patched = div[0] == 1 && div[1] == 1;
+    if (!patched && (div[0] != 3 || div[1] != 3)) {
         host_log("graphics: refused, the light grid's job split at 0x%llx holds %ux%u, not 3x3",
                  static_cast<unsigned long long>(kLightGridDiv), div[0], div[1]);
         return;
     }
-    if (!guest_protect_rw(&image->mem, at(kLightGridDiv) & ~0xfffull, 0x1000)) {
+    if (!patched && !guest_protect_rw(&image->mem, at(kLightGridDiv) & ~0xfffull, 0x1000)) {
         host_log("graphics: cannot unprotect the light grid's job split");
         return;
     }
-    div[0] = 1;
-    div[1] = 1;
+    if (!patched) {
+        div[0] = 1;
+        div[1] = 1;
+    }
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, at(0x55289f8)));  // res_width, res_height (below)
     g_graphics_manager = static_cast<const std::uint64_t*>(guest_ptr(image->mem, at(kGraphicsManagerSlot)));
     g_tile_mem = image->mem;
     const std::uint64_t ctor[2] = {at(kTileCtorW), at(kTileCtorH)};
     for (int k = 0; k < 2; ++k) {
-        if (std::memcmp(guest_ptr(image->mem, ctor[k]), kTileCtorWas[k], sizeof(kTileCtorWas[k])) == 0) g_tile_ctor[k] = ctor[k];
+        // The instruction with any immediate: a patch list may have put its own size there already.
+        if (std::memcmp(guest_ptr(image->mem, ctor[k]), kTileCtorWas[k], 6) == 0) g_tile_ctor[k] = ctor[k];
     }
     if (!g_tile_ctor[0] || !g_tile_ctor[1]) {
         host_log("graphics: the GraphicsManager constructor's 128x128 tile is not at 0x%llx/0x%llx; the size is written into the "
@@ -1017,8 +1087,8 @@ void light_grid_install(ElfImage* image) {
     }
     host_window_on_pixels(&light_grid_window);
     host_log("graphics: light grid - one job of %ux%u tiles sized to the window, set by the manager's constructor and again only "
-             "when the window's size changes (was 3x3 jobs of 128x128 tiles; BBHOST_LIGHT_GRID=quarter: 4x4, =0: the game's)",
-             g_tiles_per_axis, g_tiles_per_axis);
+             "when the window's size changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=quarter: 4x4, =0: the game's)",
+             g_tiles_per_axis, g_tiles_per_axis, patched ? "; the split was 1x1 already, a patch's" : "");
 }
 
 // The flip during which the scene's view was last drawn, plus one (0: none
@@ -1044,13 +1114,35 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         }
         last = now;
     }
+    // SSAO and AA: a renderer's two flags, written once a generation - when
+    // the setting changes, or at its first view when the file asks for other
+    // than the game's own - and left alone in between, so the debug menu's
+    // "Enable SSAO" and "Enable AntiAliasing" (the same bytes) keep what they
+    // set. Held every view until 2026-10-14, the PC graphics settings off
+    // included, which turned the debug menu's switches back on.
+    const std::uint32_t gen = g_flags_gen.load(std::memory_order_acquire);
+    if (g_made_any.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_made_mu);
+        for (const std::uint64_t c : g_made) {
+            for (GivenRenderer& e : g_given) {
+                if (reinterpret_cast<std::uint64_t>(e.renderer) == c) e = GivenRenderer{};
+            }
+        }
+        g_made.clear();
+        g_made_any.store(false, std::memory_order_relaxed);
+    }
     auto* r = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[0]));
-    if (r) {
-        std::uint64_t caps = 0;
-        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
-        const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
-        const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
-        if (r[kSsaoFlag] != ssao || r[kAaFlag] != aa) {
+    if (r && gen) {
+        GivenRenderer* g = nullptr;
+        for (GivenRenderer& c : g_given) g = c.renderer == r ? &c : g;
+        if (!g || g->gen != gen) {
+            if (!g) g = &g_given[g_given_next++ % 16];
+            g->renderer = r;
+            g->gen = gen;
+            std::uint64_t caps = 0;
+            std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+            const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
+            const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 24) {
                 host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u", static_cast<void*>(r),
@@ -1062,6 +1154,16 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     }
     return 0;  // and the view renders as it would
 }
+
+}  // namespace
+
+void graphics_scene_context_made(std::uint64_t ctx) {
+    std::lock_guard<std::mutex> lk(g_made_mu);
+    if (g_made.size() < 64) g_made.push_back(ctx);
+    g_made_any.store(true, std::memory_order_release);
+}
+
+namespace {
 
 // A jump at a function's entry to a prologue stub (core/thunk.h) that calls
 // `host` with its argument registers, then runs the `n` bytes it displaced.
@@ -1105,6 +1207,17 @@ void live_install(ElfImage* image) {
     task_tune_install(image);
     const auto at = [&](std::uint64_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
     const std::uint64_t ca = at(kCaCopy);
+    {
+        auto* v = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kVelocityCtor)));
+        g_velocity_slide = image->mem.slide;
+        if (std::memcmp(v, kVelocityCtorBytes, sizeof(kVelocityCtorBytes)) == 0) {
+            g_velocity_mem = image->mem;
+            g_velocity_ctor = v + 6;
+        } else {
+            host_log("graphics: 0x%llx is not the graphics manager's motion blur switch; the velocity pass runs with blur off too",
+                     static_cast<unsigned long long>(kVelocityCtor));
+        }
+    }
     if (std::memcmp(guest_ptr(image->mem, ca), kCaCopyBytes, sizeof(kCaCopyBytes)) != 0) {
         host_log("graphics: refused, 0x%llx is not chromatic aberration's copy; it stays on",
                  static_cast<unsigned long long>(kCaCopy));
@@ -1138,11 +1251,6 @@ void live_install(ElfImage* image) {
                  "fog stays as the area has it",
                  static_cast<unsigned long long>(kFogUploadJump));
     }
-    if (!install_prologue_hook(image, at(kVelocityPost), kVelocityPostPrologue, sizeof(kVelocityPostPrologue),
-                               reinterpret_cast<void*>(&velocity_post_hook))) {
-        host_log("graphics: refused, 0x%llx is not motion blur's velocity post-pass; it runs with blur off too",
-                 static_cast<unsigned long long>(kVelocityPost));
-    }
     if (!install_prologue_hook(image, at(kShadowSetup), kShadowSetupPrologue, sizeof(kShadowSetupPrologue),
                                reinterpret_cast<void*>(&shadow_setup_hook))) {
         host_log("graphics: refused, 0x%llx is not the shadow setup's prologue (or no room for its hook); "
@@ -1150,9 +1258,10 @@ void live_install(ElfImage* image) {
                  static_cast<unsigned long long>(kShadowSetup));
     }
     host_settings_listen(&settings_changed);  // and at once with the settings as they are
-    host_log("graphics: SSAO and its strength, anti-aliasing, chromatic aberration, bloom, vignette, saturation, "
-             "fog and shadow distance follow their settings live%s",
-             g_ca_mask ? "" : " (chromatic aberration excepted)");
+    host_log("graphics: SSAO, anti-aliasing and motion blur's pass are written when they change (the debug menu's "
+             "switches over the same bytes keep theirs in between); AO strength, bloom, vignette, saturation, fog and "
+             "shadow distance follow their settings every view; chromatic aberration through its mask%s",
+             g_ca_mask ? "" : " (not this run: its stub could not be placed)");
 }
 
 // The rest of the flag block, for probing.
