@@ -1,6 +1,7 @@
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
 #include "engine/frame_rate_step.h"
+#include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
@@ -10,6 +11,7 @@
 #include "engine/params.h"
 #include "engine/sprj_flipper.h"
 #include "engine/loading.h"
+#include "engine/menu_steps.h"
 #include "engine/change_appearance.h"
 #include "engine/rebirth.h"
 
@@ -573,7 +575,7 @@ constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't'
 // The uncapped mode: the game's frame limit and the reference rate for what
 // cannot follow the frame time (code immediates, frame counts) - Kyo's
 // uncapped list takes 120's values too.
-constexpr int kUncappedMaxFps = 240;
+constexpr int kUncappedMaxFps = uncapped_limit::kWorldMaxFps;
 constexpr int kUncappedReferenceFps = 120;
 
 // The rates the Frame rate option offers besides 30 and uncapped
@@ -866,6 +868,13 @@ std::uint64_t g_slide = 0;
 // This frame runs with no target (a loading screen, engine/loading.h); set by
 // the hook for its own update only, never for compare mode's replay.
 bool g_fast_target = false;
+// This frame's values that follow the frame's seconds (each_frame) take its
+// measured time down to kShortestFrame, not to the uncapped limit: set by the
+// hook while the game runs uncapped outside the world (menus_unlimited).
+bool g_dt_unfloored = false;
+// The shortest frame each_frame believes: a guard against a zero or negative
+// measurement, not a limit (the title runs ~0.4 ms frames).
+constexpr float kShortestFrame = 1.0f / 20000.0f;
 // BBHOST_BENCH_UNCAPPED=1 (with BBHOST_UNCAP=1, which completes flips at
 // once): every frame runs with no target - a measure of how fast the machine
 // can run the game's frames, not a way to play it: at 60 and 90 the steps
@@ -1109,31 +1118,77 @@ void note_main_frame_work(std::uint64_t m) {
     if (last > 0 && now >= last && now - last < 10000000) frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
 }
 
-// V-Sync, kept by the settings' listener (frame_rate_install) for the
-// uncapped target below: told each change, never asked for.
+// BBHOST_UNCAPPED_FPS=N (30..240): the uncapped mode's limit, everywhere; 0
+// when unset.
+const int g_uncapped_forced = [] {
+    const char* e = std::getenv("BBHOST_UNCAPPED_FPS");
+    return uncapped_limit::forced_fps(e && *e ? std::atoi(e) : 0);
+}();
+
+// V-Sync, kept by the settings' listener (frame_rate_install): told each
+// change (F10 and the game's PC Settings change it live), never asked for.
 std::atomic<bool> g_vsync{true};
 void settings_changed(const HostSettings& hs) { g_vsync.store(hs.vsync, std::memory_order_relaxed); }
+bool vsync_setting() { return g_vsync.load(std::memory_order_relaxed); }
+
+// Character creation runs at the title with no world loaded, and its model
+// preview turns and zooms by a fixed step a frame while a direction is held
+// (chrmake_bg_controller_update, 0x1f07870: the table at 0x4b349e0), so
+// unlimited it would spin several times as fast as at 240. Its top list - the
+// Contract screen, open until the game starts (chrmake_top_build_command_list,
+// a command list's step: engine/menu_steps.h, type 7, "ChrMakeTop"; the
+// Appearance list change_appearance watches opens over it) - is held while it
+// is open, and the uncapped limit stays meanwhile. Not in the world, where no
+// character creation runs. Without the watch the menus keep the limit too.
+constexpr std::uint64_t kChrMakeListType = 7;
+constexpr char16_t kChrMakeListName[] = u"ChrMakeTop";
+int g_chrmake_watch = -1;
+std::uint64_t g_chrmake_list = 0;  // the list's step while open, a reference ours (main thread)
+
+void chrmake_tick() {
+    if (g_chrmake_watch < 0) return;
+    if (const std::uint64_t made = menu_steps_take(g_chrmake_watch)) {
+        if (!g_chrmake_list && !loading_in_world() && *menu_step_count(made) >= 1) {
+            menu_step_hold(made);  // when ours is the last reference, the list has closed
+            g_chrmake_list = made;
+            host_log("frame rate: character creation is open; the uncapped limit holds until it closes");
+        }
+    }
+    if (g_chrmake_list && *menu_step_count(g_chrmake_list) == 1) {
+        menu_step_release(g_chrmake_list);
+        g_chrmake_list = 0;
+        host_log("frame rate: character creation closed");
+    }
+}
+
+// Uncapped with V-Sync off, no world loaded and no loading screen up - the
+// title and the main menu, not character creation (above): the frame-time
+// manager waits for nothing, as on a loading screen. The uncapped mode's 240
+// is for the world: its code immediates and frame counts hold 120's values
+// (frame_rate.h), so above 240 they run more than twice as fast as real time.
+// At the title nothing runs on them - the menus step by the measured frame
+// time (the task step) and by the values each_frame writes, which then follow
+// the frame unfloored - so there the frame rate is the machine's. A loading
+// screen keeps its own rule (engine/loading.h: fast unless a cutscene follows
+// it), V-Sync on the display's refresh rate, and BBHOST_UNCAPPED_FPS its own
+// limit, everywhere. Asked every frame, so a V-Sync change in F10 takes effect
+// on the next one.
+bool menus_unlimited() {
+    if (g_chrmake_watch < 0) return false;
+    return uncapped_limit::unlimited(g_game_fps, g_uncapped_forced, vsync_setting(), loading_in_world(), loading_screen_up(),
+                                     g_chrmake_list != 0);
+}
 
 // The uncapped mode's frame limit: BBHOST_UNCAPPED_FPS=N (30..240) if set;
 // else, with V-Sync on, the display's refresh rate (a PC game's V-Sync: no
-// frame the display cannot show), and with it off 240. Asked every frame; the
-// refresh rate is cached by the window (once a second) and V-Sync kept by the
-// settings' listener.
+// frame the display cannot show), and with it off 240 (outside the world
+// none: menus_unlimited). Asked every frame; the refresh rate is cached by
+// the window (once a second) and V-Sync kept by the settings' listener.
 float uncapped_target() {
-    static const int forced = [] {
-        const char* e = std::getenv("BBHOST_UNCAPPED_FPS");
-        const int v = e && *e ? std::atoi(e) : 0;
-        return v <= 0 ? 0 : std::clamp(v, 30, kUncappedMaxFps);
-    }();
-    float limit = static_cast<float>(kUncappedMaxFps);
-    if (forced) {
-        limit = static_cast<float>(forced);
-    } else {
-        if (g_vsync.load(std::memory_order_relaxed)) {
-            const float hz = host_window_refresh_hz();  // 0 headless, or when the display does not say
-            if (hz >= 30.0f) limit = std::min(limit, hz);
-        }
-    }
+    const int forced = g_uncapped_forced;
+    const bool vsync = !forced && vsync_setting();
+    // The display's refresh rate: 0 headless, or when the display does not say.
+    const float limit = uncapped_limit::limit_fps(forced, vsync, vsync ? host_window_refresh_hz() : 0.0f);
     static float said = -1.0f;
     if (limit != said) {
         said = limit;
@@ -1253,7 +1308,7 @@ void each_frame(const SprjFlipper* f) {
             put<std::int32_t>(g_play_ms_va, ms);
         }
     }
-    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
+    const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
     const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
@@ -1306,10 +1361,20 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     if (g_source == Source::Ours) {
         note_main_frame_work(saved[5]);
         RealClock clock;
-        g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
+        chrmake_tick();
+        const bool unlimited = converted && menus_unlimited();
+        static int said_unlimited = -1;
+        if (said_unlimited != static_cast<int>(unlimited) && g_game_fps == 0) {
+            said_unlimited = unlimited;
+            host_log("frame rate: uncapped, %s", unlimited ? "no frame limit outside the world (V-Sync off)"
+                                                           : "the world's or V-Sync's limit (uncapped_target)");
+        }
+        g_fast_target = converted && (g_bench_uncapped || loading_fast_now() || unlimited);
         sprj_flipper_update(f, clock, pace_target());
         g_fast_target = false;
+        g_dt_unfloored = unlimited;
         if (converted) each_frame(f);
+        g_dt_unfloored = false;
         if (g_frames.fetch_add(1, std::memory_order_relaxed) == 0) {
             host_log("frame source: SprjFlipper::Update is ours (0x%llx, %s); the guest's no longer runs",
                      static_cast<unsigned long long>(saved[5]), converted ? mode_name(g_game_fps).c_str() : "the game's own mode");
@@ -1713,6 +1778,13 @@ void frame_rate_install(ElfImage* image) {
     }
     g_game_fps = got;
     hle_video_set_game_pace(got);  // above 60 and uncapped: flips complete at once (hle/video.cpp)
+    if (got == 0) {
+        // Uncapped: character creation is told apart from the title's menus
+        // (menus_unlimited); without that the menus keep the limit.
+        g_chrmake_watch = menu_steps_watch(kChrMakeListType, kChrMakeListName);
+        if (g_chrmake_watch >= 0 && !menu_steps_install(image)) g_chrmake_watch = -1;
+        if (g_chrmake_watch < 0) host_log("frame rate: character creation cannot be watched; the title's menus keep the uncapped limit");
+    }
     frame_tick_install(image);
     const std::size_t kCountsN = sizeof(kCounts) / sizeof(kCounts[0]), kBytesN = sizeof(kBytes) / sizeof(kBytes[0]);
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);

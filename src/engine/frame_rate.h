@@ -30,7 +30,10 @@
 //    each frame's length.
 //  - uncapped: the same, with a target of the display's refresh rate with
 //    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
-//    immediates and counts at 120's values.
+//    immediates and counts at 120's values. With V-Sync off at the title and
+//    the main menu (no world loaded, no loading screen, not character
+//    creation) there is no target at all: nothing there counts frames, and
+//    what follows the frame's time takes it whole.
 // Above 60 and uncapped flips complete as soon as they are recorded (the game
 // paces itself; hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0,
 // +0x271, +0x272, +0x2c4) are cleared so nothing drops the game back to 30.

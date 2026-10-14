@@ -631,7 +631,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
         ImGui::Combo("Frame rate", &cap_choice, kCapLabels, kCapCount);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off.");
+            ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off in the world.");
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");

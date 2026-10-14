@@ -120,7 +120,7 @@ Setting g_set[kSettingCount] = {
     // reads as 60 (host_options_load).
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
      "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
-     "(the display's refresh rate with V-Sync on, up to 240 off). Applies on the next run.",
+     "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
      false},
     // What reaches the screen, counted by the presenter (host/window.cpp).
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
