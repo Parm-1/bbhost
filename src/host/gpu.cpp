@@ -4209,18 +4209,27 @@ void note_indirect_locked(std::uint64_t args_va, int kind, bool counting) {
 // slot's descriptor sets. It waits on the GPU only for the game's submissions
 // up to its frame, which the slot's fence says are done, so it has run or is
 // about to: a short wait, bounded (5 s) for a submit that never went in.
+// The counter is read and the thread sleeps between reads rather than waiting
+// inside vkWaitSemaphores: on NVIDIA's Windows driver a thread in that wait
+// held the driver's own lock, and the presenter's submit - what signals the
+// value - queued behind it with every other thread's driver call (a 5080 hung
+// at the title in each of a friend's runs, 2026-10-14). The wait is nearly
+// always over at the first read.
 void present_reads_wait(std::uint64_t target) {
     if (!g.present_timeline || g_device_lost.load(std::memory_order_relaxed)) return;
-    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &g.present_timeline;
-    wi.pValues = &target;
-    if (vkWaitSemaphores(g.device, &wi, 5'000'000'000ull) == VK_TIMEOUT) {
-        static std::atomic<int> said{0};
-        if (said.fetch_add(1) < 4)
-            host_log("gpu: the presenter's copy %llu not done 5 s after its frame; its slot retires anyway",
-                     static_cast<unsigned long long>(target));
+    const auto start = std::chrono::steady_clock::now();
+    for (int k = 0;; ++k) {
+        std::uint64_t v = 0;
+        if (vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v) != VK_SUCCESS || v >= target ||
+            g_device_lost.load(std::memory_order_relaxed))
+            return;
+        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) break;
+        if (k < 64) std::this_thread::yield();
+        else host_sleep_us(250);
     }
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 4)
+        host_log("gpu: the presenter's copy %llu not done 5 s after its frame; its slot retires anyway", static_cast<unsigned long long>(target));
 }
 
 void retire_slot_locked(int k) {
@@ -7176,6 +7185,7 @@ std::uint64_t host_gpu_submissions_completed() {
 
 void* host_gpu_timeline() { return g_timeline_on.load(std::memory_order_acquire) ? g.timeline : VK_NULL_HANDLE; }
 void* host_gpu_present_timeline() { return g_timeline_on.load(std::memory_order_acquire) ? g.present_timeline : VK_NULL_HANDLE; }
+std::uint32_t host_gpu_vendor_id() { return g.vendor_id; }
 void host_gpu_present_reads_locked(std::uint64_t target) {
     if (!g.slot_count) return;
     Gpu::Slot& sl = g.slots[g.slot];
