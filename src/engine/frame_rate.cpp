@@ -425,6 +425,25 @@ constexpr Site kFrameTimeSites[] = {
     // fixed 1/60 a frame (the 60 FPS++ sites already point its other path at
     // the slot): vmovss xmm4, [0x4d29e70 -> the slot].
     {0x02713d8d, "c5fa1025db606102", "c5fa1025736b0403"},
+    // The same function uses that one step twice: as the wind slots' wave
+    // time (t += dt, the w lane of WindForceAndTime) and as the force it
+    // uploads (WindForceAndTime.xyz = V * dt, PointWindForce.x = speed * dt),
+    // which the grass vertex shader multiplies the bend by. With the frame's
+    // time in both the sway ran at the right speed but bent by each frame's
+    // length - about 22% of the authored bend at 134 fps, shaking ±15% frame
+    // to frame, and up to 4.5x on one long frame (Kyo, 2026-10-14: "animating
+    // at the same speed as if i was at 30 fps BUT it's also twitching and
+    // spazzing very fast every once in a while"). The force takes the
+    // authored 1/30 (0x4d26364, which no table converts) and the time keeps
+    // the frame's ([rbp-0x170], the slot).
+    // Before: vmovdqa xmm14,[rbp-0x170]. After: vmovss xmm14,[0x4d26364].
+    {0x027149ea, "c5796fb590feffff", "c57a103572196102"},
+    // Before: lea rax,[0x5940df9]; cmp byte [rax],0; vxorps xmm10,xmm10,xmm10;
+    // mov r8d,[rbp-0x1b8]; jne +5; vmovdqa xmm10,xmm14. After: mov r8d,
+    // [rbp-0x1b8]; vxorps xmm10,xmm10,xmm10; cmp byte [0x5940df9],0; jne +8;
+    // vmovdqa xmm10,[rbp-0x170] (rax is written before it is read again).
+    {0x02714b26, "488d05ccc22203803800c4412857d2448b8548feffff7505c441796fd6",
+     "448b8548feffffc4412857d2803dc0c22203007508c5796f9590feffff"},
 };
 
 // The play time (GameDataMan+0x94, milliseconds: the save list's clock and
