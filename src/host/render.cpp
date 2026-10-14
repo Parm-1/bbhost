@@ -15193,8 +15193,9 @@ static bool draw_impl(const GpuDraw& d) {
         g_order_logs.fetch_add(1);
         host_log("order: DRAW 0x%llx %s n=%u", static_cast<unsigned long long>(g_order_target), pl.name.c_str(), d.index_count);
     }
-    // The recent-draw ring (gpu_internal.h): tooling, and the glitch hunt's.
-    if (host_tooling() || glitch_on()) {
+    // The recent-draw ring (gpu_internal.h): tooling, the glitch hunt's, and
+    // the GPU's progress markers, whose draw numbers are its places.
+    if (host_tooling() || glitch_on() || g.has_checkpoints) {
         DrawRec& r = g_draw_recs[g_draw_rec_next++ % kDrawRecs];
         const std::size_t name_len = std::min<std::size_t>(pl.name.size(), sizeof(r.name) - 1);  // no snprintf: every draw
         std::memcpy(r.name, pl.name.data(), name_len);
