@@ -4706,9 +4706,18 @@ std::string image_heap_report() {
 //                     tight memory) in play, BBHOST_IMAGE_HEAP_SPARE_LOADING
 //                     (4; 1) during a load; an empty block above that goes
 //                     back after 10 s in play
-//   upload staging    BBHOST_STAGING_FLOOR_MB (256) kept in play, chunks
-//                     over it freed after 30 s; BBHOST_STAGING_RESERVE_MB
-//                     (768; 256) made ready during a load
+//   upload staging    BBHOST_STAGING_FLOOR_MB (256) made at the start;
+//                     BBHOST_STAGING_RESERVE_MB (768; 256) made ready during
+//                     a load and kept in play for the next one, what is over
+//                     it given back while a loading screen is up
+// Staging stays in play because giving it back stalls the frames: each 64 MiB
+// chunk's vkFreeMemory took 22-27 ms on the RTX 4070, and the frame it fell
+// in ran 29-47 ms against 14-17 around it, one every two seconds for the 16 s
+// after every load - after each death, lamp and area change (the frees of
+// image heap blocks, 7-9 ms, show no such frame). The staging made again at
+// the next load cost ~30 ms a chunk of pinning besides. BBHOST_STAGING_RETURN=1
+// gives it back in play as before: down to the floor after 30 s, a chunk
+// every two seconds.
 // BBHOST_MEMORY_KEEPER=0 restores the old fixed reserve (six blocks and
 // 768 MiB at boot, never given back) for comparison.
 std::atomic<bool> g_loading_screen{false};
@@ -4731,6 +4740,7 @@ void start_memory_reserve() {
     const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", few ? 0 : 1);
     const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
+    const bool staging_return = env("BBHOST_STAGING_RETURN", 0) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
         // The heap's blocks are of the memory type its first image asked for.
@@ -4806,10 +4816,11 @@ void start_memory_reserve() {
                      static_cast<unsigned long long>(made >> 20), added);
             return;
         }
-        host_log("gpu: memory keeper: image heap spare %llu block(s) in play, %llu during loads; upload staging %llu MiB kept, %llu MiB "
-                 "during loads",
+        host_log("gpu: memory keeper: image heap spare %llu block(s) in play, %llu during loads; upload staging %llu MiB at the start, "
+                 "%llu MiB from a load on%s",
                  static_cast<unsigned long long>(spare_play), static_cast<unsigned long long>(spare_load),
-                 static_cast<unsigned long long>(floor >> 20), static_cast<unsigned long long>(reserve >> 20));
+                 static_cast<unsigned long long>(floor >> 20), static_cast<unsigned long long>(reserve >> 20),
+                 staging_return ? ", given back to the start's in play (BBHOST_STAGING_RETURN=1)" : ", kept in play (BBHOST_STAGING_RETURN=1 gives it back)");
         make_staging(floor);
         auto over_floor_since = std::chrono::steady_clock::time_point{};
         // One piece of memory goes back at a time, two seconds apart: freeing
@@ -4840,10 +4851,32 @@ void start_memory_reserve() {
                 }
             }
             make_blocks(loading ? spare_load : spare_play);
-            if (loading) continue;
-            // In play: empty blocks above the spare go back after 10 s; staging
-            // over the floor for 30 s goes back to it - one block or chunk a
-            // turn, two seconds apart.
+            if (loading) {
+                // Staging over the reserve (chunks the command processor made
+                // in a burst, or one a large upload had to itself) goes back
+                // while the loading screen hides the stall, a chunk a turn.
+                DevBuffer extra;
+                {
+                    std::lock_guard<GpuMutex> lk(g.mu);
+                    if (!staging_return && g.staging_free_bytes > reserve && !g.staging_free.empty()) {
+                        extra = g.staging_free.back();
+                        g.staging_free_bytes -= extra.size;
+                        g.staging_free.pop_back();
+                    }
+                }
+                if (extra.buffer) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    vkDestroyBuffer(g.device, extra.buffer, nullptr);
+                    vkFreeMemory(g.device, extra.memory, nullptr);
+                    host_log("gpu: memory keeper: gave back %llu MiB of upload staging over the load's reserve in %.1f ms, during the load",
+                             static_cast<unsigned long long>(extra.size >> 20),
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                }
+                continue;
+            }
+            // In play: empty blocks above the spare go back after 10 s, one a
+            // turn, two seconds apart (with BBHOST_STAGING_RETURN=1 also
+            // staging over the floor for 30 s, down to it, a chunk a turn).
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
             // Down to the reserve, an empty block goes back at once, spare or
@@ -4868,7 +4901,7 @@ void start_memory_reserve() {
                         break;
                     }
                 }
-                if (g.staging_free_bytes > floor) {
+                if (staging_return && g.staging_free_bytes > floor) {
                     if (over_floor_since == std::chrono::steady_clock::time_point{}) over_floor_since = now;
                     if (now - over_floor_since >= std::chrono::seconds(30) && may_give && gone.empty() && !g.staging_free.empty()) {
                         chunks.push_back(g.staging_free.back());
