@@ -4,6 +4,7 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera.h"
 #include "engine/paramdef.h"
 #include "hle/fs.h"
 #include "log.h"
@@ -274,6 +275,7 @@ void walk() {
             }
             apply_override(t);
             dump_rows(t);
+            if (name == "LockCamParam") camera_params_changed(file);  // the camera settings' rows (engine/camera.h)
         }
     }
 }

@@ -88,7 +88,6 @@ constexpr std::uint64_t kCaCopy = 0x269faa8;
 const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0x83, 0xac, 0x00, 0x00, 0x00};
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
-std::atomic<std::uint64_t> g_seen_serial{0};
 std::atomic<bool> g_ssao{true}, g_aa{true};
 
 // ---- Draw parameters ---------------------------------------------------------
@@ -336,10 +335,13 @@ GUEST_ABI std::int64_t velocity_post_hook(std::uint64_t, const std::uint64_t*) {
     return g_motion_blur.load(std::memory_order_relaxed) ? 0 : 1;  // nonzero: the call returns at once
 }
 
-void refresh_settings() {
-    const std::uint64_t serial = host_opt_serial();
-    if (g_seen_serial.exchange(serial) == serial) return;
-    const HostSettings hs = host_settings();
+// The settings' listener (host_settings_listen, from live_install): told each
+// change once, on the thread that made it, it keeps the values the hooks
+// below apply - the hooks read these and never the settings, so a view costs
+// no settings lookup at all. What the hooks write they write every view, as
+// they must: the game derives those values again for each view (the area's
+// draw parameters), and a value applied once would last one view.
+void settings_changed(const HostSettings& hs) {
     g_ssao.store(hs.ssao);
     g_aa.store(hs.anti_alias);
     set_chromatic_aberration(hs.chromatic_aberration);
@@ -356,7 +358,6 @@ void refresh_settings() {
 
 // sub_12669d0's entry: the SSAO object in rdi, its block just copied in.
 GUEST_ABI std::int64_t ssao_draw_hook(std::uint64_t, const std::uint64_t* saved) {
-    refresh_settings();
     auto* ssao = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[5]));
     const float k = g_ao_strength.load(std::memory_order_relaxed);
     if (!ssao || k == 1.0f || ssao[kSsaoHeld]) return 0;
@@ -378,7 +379,6 @@ GUEST_ABI std::int64_t ssao_draw_hook(std::uint64_t, const std::uint64_t* saved)
 
 // sub_12ac210's entry: the shadow object in rdi, the renderer's block in rsi.
 GUEST_ABI std::int64_t shadow_setup_hook(std::uint64_t, const std::uint64_t* saved) {
-    refresh_settings();
     auto* block = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[4]));
     const float k = g_shadow_scale.load(std::memory_order_relaxed);
     if (!block || k == 1.0f || block[kShadowHeld - kShadowBlock]) return 0;
@@ -498,7 +498,6 @@ void log_glare(float glare, float power, float bloom, bool vignette) {
 
 // sub_25d4860's entry: the YEBIS object in rdi.
 GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* saved) {
-    refresh_settings();
     const auto* yebis = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5]));
     if (!g_post_block || !yebis || yebis[kYebisHeld]) return 0;
     const float bloom = g_bloom.load(std::memory_order_relaxed);
@@ -726,7 +725,6 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
 // the table, all three checked against the fog manager before anything is
 // written.
 GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved) {
-    refresh_settings();
     const float k = g_fog.load(std::memory_order_relaxed);
     if (k == 1.0f && g_fog_test.n == 0) return 0;
     std::uint64_t gm = 0, fm = 0;
@@ -974,7 +972,6 @@ std::atomic<std::uint64_t> g_scene_view_flip{0};
 
 GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* saved) {
     g_scene_view_flip.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
-    refresh_settings();
     camera_tick();
     light_grid_tick();
     lod_bias_tick();
@@ -1097,7 +1094,7 @@ void live_install(ElfImage* image) {
                  "shadow distance stays as the area has it",
                  static_cast<unsigned long long>(kShadowSetup));
     }
-    refresh_settings();
+    host_settings_listen(&settings_changed);  // and at once with the settings as they are
     host_log("graphics: SSAO and its strength, anti-aliasing, chromatic aberration, bloom, vignette, saturation, "
              "fog and shadow distance follow their settings live%s",
              g_ca_mask ? "" : " (chromatic aberration excepted)");

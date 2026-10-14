@@ -1864,7 +1864,7 @@ bool host_window_pump() {
     // The FPS counter, top right, under everything else the overlay draws.
     // The number is refreshed twice a second: every frame, it flickers
     // between neighbours and cannot be read.
-    if (host_settings().fps_counter) {
+    if (host_settings_ref().fps_counter) {
         static int shown = 0;
         static std::chrono::steady_clock::time_point shown_at;
         // Beside it, how busy our work kept the GPU (host/gpu_busy.cpp) over
@@ -1964,7 +1964,7 @@ bool host_window_pump() {
             char text[64];
             std::snprintf(text, sizeof(text), "Building shaders: %zu left", left);
             const float scale = 0.8f, w = host_overlay_text_width(scale, text);
-            const float x = dw - w - 20.0f, y = host_settings().fps_counter ? 14.0f + 24.0f * scale + 16.0f : 14.0f;
+            const float x = dw - w - 20.0f, y = host_settings_ref().fps_counter ? 14.0f + 24.0f * scale + 16.0f : 14.0f;
             host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
             host_overlay_text(x, y, scale, 0xe8dcc0ffu, text);
         }
@@ -2049,7 +2049,7 @@ bool host_window_pump() {
         const bool idle = !host_options_open() && !ingame_menu_open() && (std::chrono::steady_clock::now() - last > std::chrono::seconds(5) ||
                                                    host_input_device() == InputDevice::Pad);
         const bool pointer = !host_mouse_relative() && !idle;
-        const bool draw_cursor = host_settings().draw_cursor;
+        const bool draw_cursor = host_settings_ref().draw_cursor;
         const bool ours = draw_cursor && pointer && !ingame_menu_open();  // the menu draws its own on top
         // The window system's, when it is the one in use. Relative mode hides
         // it by itself; this keeps the state it returns to right.

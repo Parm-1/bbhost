@@ -1109,11 +1109,16 @@ void note_main_frame_work(std::uint64_t m) {
     if (last > 0 && now >= last && now - last < 10000000) frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
 }
 
+// V-Sync, kept by the settings' listener (frame_rate_install) for the
+// uncapped target below: told each change, never asked for.
+std::atomic<bool> g_vsync{true};
+void settings_changed(const HostSettings& hs) { g_vsync.store(hs.vsync, std::memory_order_relaxed); }
+
 // The uncapped mode's frame limit: BBHOST_UNCAPPED_FPS=N (30..240) if set;
 // else, with V-Sync on, the display's refresh rate (a PC game's V-Sync: no
 // frame the display cannot show), and with it off 240. Asked every frame; the
-// refresh rate is cached by the window (once a second) and V-Sync read again
-// only when a setting changed.
+// refresh rate is cached by the window (once a second) and V-Sync kept by the
+// settings' listener.
 float uncapped_target() {
     static const int forced = [] {
         const char* e = std::getenv("BBHOST_UNCAPPED_FPS");
@@ -1124,13 +1129,7 @@ float uncapped_target() {
     if (forced) {
         limit = static_cast<float>(forced);
     } else {
-        static std::uint64_t serial = 0;
-        static bool vsync = true;
-        if (const std::uint64_t s = host_opt_serial(); s != serial) {
-            serial = s;
-            vsync = host_settings().vsync;
-        }
-        if (vsync) {
+        if (g_vsync.load(std::memory_order_relaxed)) {
             const float hz = host_window_refresh_hz();  // 0 headless, or when the display does not say
             if (hz >= 30.0f) limit = std::min(limit, hz);
         }
@@ -1664,6 +1663,7 @@ asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
 int frame_rate_game_fps() { return g_game_fps; }
 
 void frame_rate_install(ElfImage* image) {
+    host_settings_listen(&settings_changed);
     const std::uint64_t at = image->mem.slide + (kFrameManager - kPreferredGuestSlide);
     g_slide = image->mem.slide;
     loading_bind(image->mem.slide);
