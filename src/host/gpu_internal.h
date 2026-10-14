@@ -262,6 +262,9 @@ struct Gpu {
     // sleep in the driver, not a poll (host_gpu_wait_completed). Null without
     // timelineSemaphore, or with BBHOST_TIMELINE=0: the slots' fences, polled.
     VkSemaphore timeline = VK_NULL_HANDLE;
+    // The presenter's own-queue copies' timeline (host_gpu_present_reads_locked):
+    // each signals the value it registered. Made with `timeline`.
+    VkSemaphore present_timeline = VK_NULL_HANDLE;
     bool has_device_fault = false;            // VK_EXT_device_fault
     bool has_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, or AMD's buffer markers
     PFN_vkCmdSetCheckpointNV cmd_checkpoint = nullptr;
@@ -300,6 +303,10 @@ struct Gpu {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         bool in_flight = false;
         std::uint64_t serial = 0;  // Gpu::flushes when this slot was submitted
+        // The presenter's own-queue copy recorded while this slot was the one
+        // being recorded: its value on Gpu::present_timeline, waited for
+        // before the slot retires (0: none).
+        std::uint64_t present_target = 0;
         // What the submission holds, for the line a wait for it that runs long
         // writes (fence_wait_locked): the draws, dispatches and tessellated
         // draws recorded since the submission before, and the flip.

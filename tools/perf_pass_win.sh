@@ -79,6 +79,9 @@ setup_window = false
 check = false
 [plugins]
 debug_menu = $([ "${PERF_DEBUG_MENU:-1}" = 1 ] && echo true || echo false)
+# Its settings counted as seen: a run with a window otherwise opened the setup
+# window on the Plugins tab and waited there (headless runs skip it).
+seen = "debug_menu@1.0.0"
 [bbhost]
 config_version = 3
 TOML

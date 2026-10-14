@@ -2308,6 +2308,8 @@ bool init_locked() {
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         sci.pNext = &st;
         if (vkCreateSemaphore(g.device, &sci, nullptr, &g.timeline) != VK_SUCCESS) g.timeline = VK_NULL_HANDLE;
+        if (g.timeline && vkCreateSemaphore(g.device, &sci, nullptr, &g.present_timeline) != VK_SUCCESS)
+            g.present_timeline = VK_NULL_HANDLE;
     }
     g_timeline_on.store(g.timeline != VK_NULL_HANDLE, std::memory_order_release);
     host_log("gpu: submissions %s", g.timeline ? "signal a timeline semaphore: completion is read and waited for without the renderer's lock"
@@ -4202,6 +4204,25 @@ void note_indirect_locked(std::uint64_t args_va, int kind, bool counting) {
     g_indirect_recs.push_back({g.flushes, args_va, static_cast<std::uint8_t>(kind), counting});
 }
 
+// The presenter's own-queue copy recorded while a slot was the one being
+// recorded reads what retiring that slot frees: the game's display image, the
+// slot's descriptor sets. It waits on the GPU only for the game's submissions
+// up to its frame, which the slot's fence says are done, so it has run or is
+// about to: a short wait, bounded for a submit that never went in.
+void present_reads_wait(std::uint64_t target) {
+    if (!g.present_timeline || g_device_lost.load(std::memory_order_relaxed)) return;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &g.present_timeline;
+    wi.pValues = &target;
+    if (vkWaitSemaphores(g.device, &wi, 200'000'000ull) == VK_TIMEOUT) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 4)
+            host_log("gpu: the presenter's copy %llu not done 200 ms after its frame; its slot retires anyway",
+                     static_cast<unsigned long long>(target));
+    }
+}
+
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -4236,6 +4257,10 @@ void retire_slot_locked(int k) {
         // (submit_locked), and bbhost ends.
         sl.in_flight = false;
         return;
+    }
+    if (sl.present_target) {
+        present_reads_wait(sl.present_target);
+        sl.present_target = 0;
     }
     vkResetFences(g.device, 1, &sl.fence);
     indirect_stats_retired_locked(sl.serial);
@@ -7167,6 +7192,14 @@ std::uint64_t host_gpu_submissions_completed() {
         }
     }
     return done;
+}
+
+void* host_gpu_timeline() { return g_timeline_on.load(std::memory_order_acquire) ? g.timeline : VK_NULL_HANDLE; }
+void* host_gpu_present_timeline() { return g_timeline_on.load(std::memory_order_acquire) ? g.present_timeline : VK_NULL_HANDLE; }
+void host_gpu_present_reads_locked(std::uint64_t target) {
+    if (!g.slot_count) return;
+    Gpu::Slot& sl = g.slots[g.slot];
+    sl.present_target = std::max(sl.present_target, target);
 }
 
 bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {

@@ -299,6 +299,7 @@ struct Presenter {
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     bool latest_ready = false;  // the device has FIFO_LATEST_READY enabled (gpu.cpp)
     bool gpu_wait = false;      // sleep on the frame's fence before presenting (present_gpu_wait_default)
+    std::uint64_t present_value = 0;  // the last own-queue copy's value on host_gpu_present_timeline()
     std::mutex mu;
     bool ok = false;
     std::uint64_t frames = 0;
@@ -335,6 +336,15 @@ const bool g_present_pass = !present_env_off("BBHOST_PRESENT_PASS");
 // queued is the next vblank. By default the acquire signals a fence the
 // presenting thread waits for, so only this thread waits for the display.
 const bool g_acquire_fence = !present_env_off("BBHOST_PRESENT_ACQUIRE_FENCE");
+// BBHOST_PRESENT_OWN_QUEUE=0: the presenter's copy of a frame goes into the
+// renderer's stream, behind everything the game has queued by then. By
+// default (a second queue, the timeline, the acquire's fence) it goes on the
+// presenter's own queue and waits there only for its frame's submissions.
+// Behind the game's next frames, a present in the world slept ~4.6 ms for
+// them and then spent a refresh in the driver's present: two refreshes of a
+// 180 Hz display a present, ~94 frames shown a second of the ~187 the game
+// made (Kyo's log, 2026-10-14).
+const bool g_present_own_queue = !present_env_off("BBHOST_PRESENT_OWN_QUEUE");
 // BBHOST_PRESENT_SUBMIT=1: before its blit the presenter submits whatever the
 // renderer is recording, as it did on every frame. The frame it shows is
 // normally submitted already (the command processor submits each job before
@@ -669,9 +679,12 @@ bool vk_start() {
     g_vk.ok = true;
     host_log("vulkan: %s, swapchain %ux%u, %zu images", props.deviceName, g_vk.extent.width, g_vk.extent.height,
              g_vk.images.size());
-    host_log("present: the acquire %s; the renderer's recording submitted %s; the present %s",
+    host_log("present: the acquire %s; the renderer's recording submitted %s; the copy %s; the present %s",
              g_acquire_fence && g_vk.acquire_fence ? "waited for on this thread (a fence)" : "waited for on the GPU queue (a semaphore)",
              g_present_submit_always ? "before every blit" : "only when the flip's frame is still in it",
+             g_present_own_queue && g_vk.present_queue && host_gpu_timeline() && host_gpu_present_timeline()
+                 ? "on the presenter's own queue after its frame alone (BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
+                 : "behind the game's queued work",
              g_vk.gpu_wait ? "after the frame is done on the GPU (a sleeping wait)" : "at once (the driver waits for the frame)");
     return true;
 }
@@ -718,10 +731,16 @@ struct PresentStats {
     std::uint64_t one_pass = 0, blits = 0, clears = 0, overlay_passes = 0;
     std::uint64_t overlay_frames = 0, menu_frames = 0;
     std::uint64_t gpu_wait_us = 0, acquire_wait_us = 0;
+    std::uint64_t own_queue = 0;  // copies on the presenter's own queue (g_present_own_queue)
 };
 PresentStats g_pstats;
 
-void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip) {
+// The newest frame the game has flipped, for vk_present to copy: false when
+// none is waiting (the presenting thread's slot, below).
+bool present_take(int& buffer, std::uint64_t& va, unsigned& w, unsigned& h, PresentFlip& flip);
+
+// True once it took a frame (present_take); false when it gave up before.
+bool vk_present() {
     const auto t_enter = std::chrono::steady_clock::now();
     const std::uint64_t cpu_enter = host_thread_cpu_ns();
     const auto us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -730,7 +749,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     present_step("taking the present lock");
     std::lock_guard<std::mutex> lock(g_vk.mu);
     if (!g_vk.ok) {
-        return;
+        return false;
     }
     // BBHOST_PRESENT_DELAY_US: pretend the display blocks us for this long, so
     // a run on a virtual display (Xvfb never blocks in acquire) can be checked
@@ -775,7 +794,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
-        return;
+        return false;
     }
     // SUBOPTIMAL is a success: the image is ours and can be presented. Windows
     // can say it every frame (borderless fullscreen after an alt-tab), and a
@@ -794,14 +813,14 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         const bool remade = vk_create_swapchain();
         host_gpu_unlock();
         if (!remade) {
-            return;
+            return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
         r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem, acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
     }
     if (r != VK_SUCCESS) {
-        return;
+        return false;
     }
     if (by_fence) {
         // Until the display lets go of the image. With FIFO and frames queued
@@ -812,6 +831,19 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         vkWaitForFences(g_vk.device, 1, &g_vk.acquire_fence, VK_TRUE, UINT64_MAX);
         g_pstats.acquire_wait_us += us(t0, std::chrono::steady_clock::now());
     }
+    // The frame: the newest the game has flipped, taken now - after the waits
+    // above, which last a GPU frame when the GPU is behind - not before them.
+    // A frame taken first was copied a frame later, from a display buffer the
+    // game may have begun a newer frame in by then (it draws in a buffer again
+    // once a later flip has completed), behind that frame's first passes: the
+    // frame shown half drawn, the effects - drawn late in a frame - flickering
+    // while the GPU was ~100% busy (Kyo, 2026-10-14). The image is acquired, so
+    // without a newer frame the last one is shown again.
+    static int buffer_index = 0;
+    static std::uint64_t display_va = 0;
+    static unsigned display_w = 0, display_h = 0;
+    PresentFlip flip;
+    if (!present_take(buffer_index, display_va, display_w, display_h, flip)) flip = PresentFlip{};
     const auto t_acquired = std::chrono::steady_clock::now();
     // Queued draws land before the blit: submissions on one queue execute in
     // submission order, so submitting them first is enough. Waiting for them
@@ -1024,13 +1056,55 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &rendered;
     present_step("submitting the blit");
-    // Through the submission thread when it runs: queued behind the game's
-    // work under the renderer's lock, which then goes at once - the kernel's
-    // ~1.3 ms of vkQueueSubmit on a Steam Deck, held under it, cost the
-    // command processor ~1.5 ms a frame. Only presenting waits for the
-    // submission to have gone in.
-    const std::uint64_t ticket = host_gpu_submit_presenter(g_vk.cmd, by_fence ? nullptr : acquire_sem, wait_stage, rendered, g_vk.fence);
-    if (ticket) {
+    // On the presenter's own queue (g_present_own_queue): it waits on the GPU
+    // for the frame's submissions only, on the game's timeline. Registered on
+    // the slot being recorded, under the renderer's lock, so nothing it reads
+    // is freed under it (host_gpu_present_reads_locked).
+    const VkSemaphore game_tl = static_cast<VkSemaphore>(host_gpu_timeline());
+    const VkSemaphore present_tl = static_cast<VkSemaphore>(host_gpu_present_timeline());
+    const bool own_queue =
+        g_present_own_queue && by_fence && g_vk.present_queue && game_tl && present_tl && flip.submit_need != ~0ull;
+    std::uint64_t ticket = 0;
+    if (own_queue) {
+        const std::uint64_t value = ++g_vk.present_value;
+        host_gpu_present_reads_locked(value);
+        host_gpu_unlock();
+        locked = false;
+        const VkSemaphore signals[2] = {rendered, present_tl};
+        const std::uint64_t signal_values[2] = {0, value};  // the binary semaphore's is ignored
+        const std::uint64_t frame_value = flip.submit_need;
+        const VkPipelineStageFlags frame_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        ti.waitSemaphoreValueCount = 1;
+        ti.pWaitSemaphoreValues = &frame_value;
+        ti.signalSemaphoreValueCount = 2;
+        ti.pSignalSemaphoreValues = signal_values;
+        VkSubmitInfo own{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        own.pNext = &ti;
+        own.waitSemaphoreCount = 1;
+        own.pWaitSemaphores = &game_tl;
+        own.pWaitDstStageMask = &frame_stage;
+        own.commandBufferCount = 1;
+        own.pCommandBuffers = &g_vk.cmd;
+        own.signalSemaphoreCount = 2;
+        own.pSignalSemaphores = signals;
+        const VkResult sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            // Nothing waits for a copy that never went in (present_reads_wait).
+            VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+            ssi.semaphore = present_tl;
+            ssi.value = value;
+            vkSignalSemaphore(g_vk.device, &ssi);
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1) < 4) host_log("present: the copy's submit on the presenter's queue failed (%d)", static_cast<int>(sr));
+        }
+        ++g_pstats.own_queue;
+    } else if ((ticket = host_gpu_submit_presenter(g_vk.cmd, by_fence ? nullptr : acquire_sem, wait_stage, rendered, g_vk.fence))) {
+        // Through the submission thread when it runs: queued behind the game's
+        // work under the renderer's lock, which then goes at once - the kernel's
+        // ~1.3 ms of vkQueueSubmit on a Steam Deck, held under it, cost the
+        // command processor ~1.5 ms a frame. Only presenting waits for the
+        // submission to have gone in.
         host_gpu_unlock();
         locked = false;
         host_gpu_wait_submitted(ticket);
@@ -1136,18 +1210,20 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         host_log("present: per frame: bb-present CPU %.3f ms; flip to present %.1f ms (max %.1f), %llu of 300 shown on arrival; "
                  "the renderer's recording submitted here %llu, left to the command processor %llu; one pass %llu, blits %llu, clears %llu, "
                  "overlay renderings %llu; overlay drawn %llu, F9 menu %llu; slept %.2f ms on the frame's GPU work, %.2f ms on the "
-                 "acquired image; %s, %zu images",
+                 "acquired image; %llu copied on the presenter's own queue; %s, %zu images",
                  static_cast<double>(ps.cpu_ns) / 1e6 / n, ps.latency_n ? static_cast<double>(ps.latency_ns) / 1e6 / static_cast<double>(ps.latency_n) : 0.0,
                  static_cast<double>(ps.latency_max_ns) / 1e6, static_cast<unsigned long long>(ps.on_arrival),
                  static_cast<unsigned long long>(ps.submits_forced), static_cast<unsigned long long>(ps.submits_left),
                  static_cast<unsigned long long>(ps.one_pass), static_cast<unsigned long long>(ps.blits), static_cast<unsigned long long>(ps.clears),
                  static_cast<unsigned long long>(ps.overlay_passes), static_cast<unsigned long long>(ps.overlay_frames),
                  static_cast<unsigned long long>(ps.menu_frames), static_cast<double>(ps.gpu_wait_us) / 1e3 / n,
-                 static_cast<double>(ps.acquire_wait_us) / 1e3 / n, present_mode_name(g_vk.mode), g_vk.images.size());
+                 static_cast<double>(ps.acquire_wait_us) / 1e3 / n, static_cast<unsigned long long>(ps.own_queue),
+                 present_mode_name(g_vk.mode), g_vk.images.size());
         ps = PresentStats{};
         wait_us = work_us = flush_us = lock_us = blit_us = submit_us = queue_present_us = 0;
         last = now;
     }
+    return true;
 }
 
 // ---- input -----------------------------------------------------------------
@@ -2159,15 +2235,17 @@ void present_thread_main() {
     host_thread_set_name("bb-present");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-present");  // core/host_clock.h
     for (;;) {
-        PendingPresent p;
         {
             std::unique_lock<std::mutex> lk(g_present_mu);
             g_present_cv.wait(lk, [] { return g_present_quit || g_present_next.has; });
             if (g_present_quit) return;
-            p = g_present_next;
+        }
+        // vk_present takes the frame once its waits are over (present_take);
+        // one it gave up on before is dropped, as it was when taken first.
+        if (!vk_present()) {
+            std::lock_guard<std::mutex> lk(g_present_mu);
             g_present_next.has = false;
         }
-        vk_present(p.buffer, p.va, p.w, p.h, p.flip);
         // With V-Sync on this returned on the display's vblank: the flip clock
         // uses it to stay in phase with the display.
         g_present_last_ns.store(static_cast<std::uint64_t>(
@@ -2175,6 +2253,18 @@ void present_thread_main() {
                                 std::memory_order_relaxed);
         g_present_serial.fetch_add(1, std::memory_order_release);
     }
+}
+
+bool present_take(int& buffer, std::uint64_t& va, unsigned& w, unsigned& h, PresentFlip& flip) {
+    std::lock_guard<std::mutex> lk(g_present_mu);
+    if (!g_present_next.has) return false;
+    buffer = g_present_next.buffer;
+    va = g_present_next.va;
+    w = g_present_next.w;
+    h = g_present_next.h;
+    flip = g_present_next.flip;
+    g_present_next.has = false;
+    return true;
 }
 #endif
 }  // namespace
