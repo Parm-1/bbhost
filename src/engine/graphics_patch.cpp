@@ -904,15 +904,24 @@ constexpr std::size_t kLightTileW = 0x78a8, kLightTileH = 0x78ac;
 const std::uint64_t* g_graphics_manager = nullptr;  // the slot, slid; null when off
 const std::uint32_t* g_res_words = nullptr;         // render width, height
 std::uint32_t g_tile_fixed[2] = {0, 0};             // BBHOST_LIGHT_GRID=WxH: that tile instead (experiments)
-// Tiles a side: 1 - one tile the window's size, Kyo's "REAL LightGrid 1080p"
-// (the constructor's 1920x1080) at whatever size the window or display is, in
-// one job ("Light Grid Div 1x1"): each light binned and drawn once. 4 (a
-// quarter of the window each way) with BBHOST_LIGHT_GRID=quarter. Measured on
-// a Radeon 8060S: 2026-10-08, the Hunter's Dream, GPU ms per 300 flips, 4 a
-// side 1,878-2,027 and one tile 1,960-2,096; 2026-10-12, Kyo's area uncapped
-// and GPU-bound, Model detail Normal, 45 s each: one tile 160.2 fps, 4 a side
-// 159.2, the game's own 128x128 tiles in 3x3 jobs (BBHOST_LIGHT_GRID=0) 165.1.
-std::uint32_t g_tiles_per_axis = 1;
+// Tiles a side: 4 - a quarter of the window each way, in one job ("Light
+// Grid Div 1x1"); 1 with BBHOST_LIGHT_GRID=window: one tile the window's size,
+// Kyo's "REAL LightGrid 1080p" (the constructor's 1920x1080) at whatever size
+// the window or display is, each light binned and drawn once (=quarter names
+// the default). The picture is the same - a tile only bounds where a light is
+// shaded, and its rect is clamped to the frame - but a light in a frame-sized
+// tile shades the whole frame. Measured: a Radeon 8060S, 2026-10-08, the
+// Hunter's Dream, GPU ms per 300 flips, 4 a side 1,878-2,027 and one tile
+// 1,960-2,096; 2026-10-12, Kyo's area uncapped and GPU-bound, Model detail
+// Normal, 45 s each: one tile 160.2 fps, 4 a side 159.2, the game's own
+// 128x128 tiles in 3x3 jobs (BBHOST_LIGHT_GRID=0) 165.1. 2026-10-14 at the
+// Central Yharnam lamp, Uncapped: a Steam Deck at its 6 W limit (GPU-bound)
+// one tile 23.3-24.0 fps, 4 a side 25.8-26.2, the game's 25.5-26.3, and the
+// same picture (eight frames of each, twice: the pairs across configurations
+// differ no more than two runs of one); an RTX 3070 Ti laptop one tile
+// 83.0-83.5, 4 a side 90.7-91.5; an RTX 4070 (main-loop-bound) the same fps,
+// one tile +10% GPU time.
+std::uint32_t g_tiles_per_axis = 4;
 // The tile is the GraphicsManager's own, written once by its constructor
 // (sub_26958d0: mov dword [rbx+0x78a8], 128 at 0x2695cb6 and [rbx+0x78ac] at
 // 0x2695cc0 - Kyo's "REAL LightGrid 1080p" puts 1920 and 1080 there) and
@@ -1043,7 +1052,7 @@ void light_grid_install(ElfImage* image) {
         host_log("graphics: light grid as the game has it (BBHOST_LIGHT_GRID=0)");
         return;
     }
-    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "quarter") == 0) g_tiles_per_axis = 4;
+    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "window") == 0) g_tiles_per_axis = 1;
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strchr(e, 'x')) {
         g_tile_fixed[0] = static_cast<std::uint32_t>(std::atoi(e));
         g_tile_fixed[1] = static_cast<std::uint32_t>(std::atoi(std::strchr(e, 'x') + 1));
@@ -1087,7 +1096,7 @@ void light_grid_install(ElfImage* image) {
     }
     host_window_on_pixels(&light_grid_window);
     host_log("graphics: light grid - one job of %ux%u tiles sized to the window, set by the manager's constructor and again only "
-             "when the window's size changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=quarter: 4x4, =0: the game's)",
+             "when the window's size changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=window: one window-sized tile, =0: the game's)",
              g_tiles_per_axis, g_tiles_per_axis, patched ? "; the split was 1x1 already, a patch's" : "");
 }
 
