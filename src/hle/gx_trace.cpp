@@ -6147,24 +6147,38 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
                 host_log("gx: those reads by caller (%zu sites, offsets from safe_read):%s", sites.size(), who.c_str());
                 // What those megabytes are, from the process's own map: the
                 // point is to name the region so the read can stop being a
-                // system call, not to guess from the address.
+                // system call, not to guess from the address. Each megabyte
+                // once: this report runs on the command processor every
+                // 100,000 draws, and reading the whole map each time (~4,000
+                // lines, 5-12 ms, every ~1.2 s in the world) said the same
+                // lines again.
 #if !defined(_WIN32)
-                if (FILE* f = std::fopen("/proc/self/maps", "r")) {
-                    char line[512];
-                    while (std::fgets(line, sizeof(line), f)) {
-                        unsigned long long lo = 0, hi = 0;
-                        if (std::sscanf(line, "%llx-%llx", &lo, &hi) != 2) continue;
-                        for (std::size_t i = 0; i < where.size() && i < 6; ++i) {
-                            const std::uint64_t at = where[i].second << 20;
-                            if (at >= lo && at < hi) {
-                                std::string t(line);
-                                while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
-                                host_log("gx:   0x%llx (%llu reads) is in %s", static_cast<ull>(at),
-                                         static_cast<ull>(where[i].first), t.c_str());
+                static std::mutex named_mu;
+                static std::set<std::uint64_t> named;  // megabytes already named (or in no mapping)
+                std::lock_guard<std::mutex> nl(named_mu);
+                std::vector<std::size_t> todo;
+                for (std::size_t i = 0; i < where.size() && i < 6; ++i) {
+                    if (!named.count(where[i].second)) todo.push_back(i);
+                }
+                if (!todo.empty()) {
+                    if (FILE* f = std::fopen("/proc/self/maps", "r")) {
+                        char line[512];
+                        while (std::fgets(line, sizeof(line), f)) {
+                            unsigned long long lo = 0, hi = 0;
+                            if (std::sscanf(line, "%llx-%llx", &lo, &hi) != 2) continue;
+                            for (const std::size_t i : todo) {
+                                const std::uint64_t at = where[i].second << 20;
+                                if (at >= lo && at < hi) {
+                                    std::string t(line);
+                                    while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
+                                    host_log("gx:   0x%llx (%llu reads) is in %s", static_cast<ull>(at),
+                                             static_cast<ull>(where[i].first), t.c_str());
+                                }
                             }
                         }
+                        std::fclose(f);
                     }
-                    std::fclose(f);
+                    for (const std::size_t i : todo) named.insert(where[i].second);
                 }
 #endif
             }
