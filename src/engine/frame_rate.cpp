@@ -1388,6 +1388,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
         sprj_flipper_update(f, clock, pace_target());
         g_fast_target = false;
+        host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
         if (converted) each_frame(f);
         if (g_frames.fetch_add(1, std::memory_order_relaxed) == 0) {
             host_log("frame source: SprjFlipper::Update is ours (0x%llx, %s); the guest's no longer runs",
@@ -1395,6 +1396,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         }
         return 1;  // done: the stub returns to the caller
     }
+    host_fps_frame_start();  // the guest's update, and its wait, follow: once a frame all the same
     if (g_source == Source::Compare) {
         // The snapshot is taken after the hook's own writes below (at 60 it
         // puts the guest in mode 2 and clears the one-shots), so both sides
