@@ -118,6 +118,10 @@ void host_mouse_set_visible(bool visible);
 // A line of text over the game for `seconds` (plugins' show_message); a new
 // one replaces the last. Any thread.
 void host_message_show(const char* text, float seconds);
+// The FPS counter's sample: a game frame starts (the main loop's frame-time
+// manager, engine/frame_rate.cpp, as its limiter lets the frame go). Nothing
+// but a flag load while the counter is off.
+void host_fps_frame_start();
 // Text entry for the game's IME dialog: while active the window collects
 // typed text in a box over the game, and the box owns the input - the game
 // sees a connected pad with nothing pressed and no pointer, as a PS4 game

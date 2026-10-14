@@ -122,9 +122,10 @@ Setting g_set[kSettingCount] = {
      "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
      "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
      false},
-    // What reaches the screen, counted by the presenter (host/window.cpp).
+    // The game's frames a second, counted as they start (host/window.cpp,
+    // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
-     "Frames per second actually presented, in the top right corner.", false},
+     "The game's frames per second, in the top right corner.", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
     {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,

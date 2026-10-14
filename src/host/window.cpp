@@ -32,7 +32,6 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -691,25 +690,66 @@ bool vk_start() {
 
 std::atomic<std::uint64_t> g_present_dropped{0};
 
-// The FPS counter (host setting fps_counter): what reaches the screen - every
-// present vk_present makes, not the flips it drops - over the last second.
-std::mutex g_fps_mu;
-std::deque<std::chrono::steady_clock::time_point> g_present_times;  // the last second's presents
+// The FPS counter (host setting fps_counter), as Kyo's Agnosis counts its
+// own: the game's frames, each from its start to the next one's on the
+// performance counter (host_fps_frame_start), 1/period averaged over time -
+// an EMA with a 2 s time constant, alpha = 1 - e^(-period / 2 s), so each
+// frame weighs by its length and the average is frames over seconds - and
+// the number shown three times a second. It used to count presents over the
+// last second: the presenter shows the newest frame, and the count was the
+// screen's (86 a second while the game made 152, until 2026-10-14) and
+// nothing like the title screen's thousands.
+// A change of more than 2x that holds for half a second (a loading screen's
+// thousands of frames a second, then the world's 150) starts the average over
+// from that half second's frames: at a 2 s time constant it would take 15 s
+// to come down from 3000 to within a frame of 150.
+constexpr double kFpsTau = 2.0;
+constexpr std::uint64_t kFpsJumpNs = 500'000'000;
+std::atomic<bool> g_fps_on{false};               // the setting, as the overlay last saw it
+std::atomic<std::uint64_t> g_fps_last_ns{0};     // the last frame's start (0: none since the counter came on)
+std::atomic<float> g_fps_avg{0.0f};              // frames a second (0: no period yet)
+std::uint64_t g_fps_jump_ns = 0;                 // when the rate left [avg / 2, 2 avg] (the main loop's thread)
+std::uint32_t g_fps_jump_frames = 0;
 
-void note_present(std::chrono::steady_clock::time_point t) {
-    std::lock_guard<std::mutex> lock(g_fps_mu);
-    g_present_times.push_back(t);
-    while (!g_present_times.empty() && t - g_present_times.front() > std::chrono::seconds(1)) {
-        g_present_times.pop_front();
+}  // namespace
+
+void host_fps_frame_start() {
+    if (!g_fps_on.load(std::memory_order_relaxed)) {
+        if (g_fps_last_ns.load(std::memory_order_relaxed)) g_fps_last_ns.store(0, std::memory_order_relaxed);
+        return;
     }
+    const std::uint64_t now = host_clock_monotonic_ns();
+    const std::uint64_t last = g_fps_last_ns.exchange(now, std::memory_order_relaxed);
+    if (!last || now <= last) {  // the first frame since the counter came on: no period yet
+        g_fps_avg.store(0.0f, std::memory_order_relaxed);
+        g_fps_jump_ns = 0;
+        return;
+    }
+    const double dt = static_cast<double>(now - last) * 1e-9;
+    const double inst = 1.0 / dt;
+    double avg = g_fps_avg.load(std::memory_order_relaxed);
+    if (avg <= 0.0) {
+        avg = inst;
+    } else {
+        avg += (1.0 - std::exp(-dt / kFpsTau)) * (inst - avg);
+        if (inst > 2.0 * avg || inst < 0.5 * avg) {
+            if (!g_fps_jump_ns) {
+                g_fps_jump_ns = last;
+                g_fps_jump_frames = 0;
+            }
+            ++g_fps_jump_frames;
+            if (now - g_fps_jump_ns >= kFpsJumpNs) {
+                avg = static_cast<double>(g_fps_jump_frames) / (static_cast<double>(now - g_fps_jump_ns) * 1e-9);
+                g_fps_jump_ns = 0;
+            }
+        } else {
+            g_fps_jump_ns = 0;
+        }
+    }
+    g_fps_avg.store(static_cast<float>(avg), std::memory_order_relaxed);
 }
 
-int presents_in_last_second(std::chrono::steady_clock::time_point now) {
-    std::lock_guard<std::mutex> lock(g_fps_mu);
-    int n = 0;
-    for (const auto& t : g_present_times) n += now - t <= std::chrono::seconds(1);
-    return n;
-}
+namespace {
 
 // Which step of a present this thread is on, for the hang watchdog: a present
 // that never comes back stops the flips, and everything behind them.
@@ -1159,7 +1199,6 @@ bool vk_present() {
     const auto t_presented = std::chrono::steady_clock::now();
     present_step("idle");
     ++g_vk.frames;
-    note_present(t_presented);
     // Where a windowed frame goes: waiting for the display (fence + acquire) or
     // doing work (flush, blit, submit). A choppy windowed run with a healthy
     // headless one is decided by these two numbers. The work splits into
@@ -1944,35 +1983,46 @@ bool host_window_pump() {
     // The host overlay's contents for this frame. Rebuilt from scratch each
     // pump; when nothing draws, the presenter's path is exactly as it was.
     host_overlay_reset();
-    // The FPS counter, top right, under everything else the overlay draws.
-    // The number is refreshed twice a second: every frame, it flickers
-    // between neighbours and cannot be read.
-    if (host_settings_ref().fps_counter) {
+    // The FPS counter, top right, under everything else the overlay draws: the
+    // game's frame rate (host_fps_frame_start's average), refreshed three
+    // times a second - every frame, it flickers between neighbours and cannot
+    // be read. A game that has made no frame for half a second reads what that
+    // wait comes to, not its last rate.
+    const bool fps_on = host_settings_ref().fps_counter;
+    g_fps_on.store(fps_on, std::memory_order_relaxed);
+    if (fps_on) {
         static int shown = 0;
-        static std::chrono::steady_clock::time_point shown_at;
+        static std::uint64_t shown_at = 0;
         // Beside it, how busy our work kept the GPU (host/gpu_busy.cpp) over
-        // the last two refreshes - about the same second the count covers.
-        // Task Manager's GPU column cannot say it on AMD's driver.
+        // the last three refreshes, about a second. Task Manager's GPU column
+        // cannot say it on AMD's driver.
         static int gpu_pct = -1;
-        static GpuBusy busy_was[2];
-        static std::chrono::steady_clock::time_point busy_at[2];
-        const auto now = std::chrono::steady_clock::now();
-        if (now - shown_at >= std::chrono::milliseconds(500)) {
-            shown = presents_in_last_second(now);
+        static GpuBusy busy_was[3];
+        static std::uint64_t busy_at[3];
+        const std::uint64_t now = host_clock_monotonic_ns();
+        if (now - shown_at >= 333'000'000) {
+            const std::uint64_t last = g_fps_last_ns.load(std::memory_order_relaxed);
+            double fps = g_fps_avg.load(std::memory_order_relaxed);
+            if (last && now > last + 500'000'000) fps = std::min(fps, 1e9 / static_cast<double>(now - last));
+            shown = last ? static_cast<int>(fps + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
             if (b.on && busy_was[0].on) {
-                const double secs = std::chrono::duration<double>(now - busy_at[0]).count();
+                const double secs = static_cast<double>(now - busy_at[0]) * 1e-9;
                 const double pct = secs > 0.0 ? static_cast<double>(b.busy_ns - busy_was[0].busy_ns) / 1e7 / secs : 0.0;
                 gpu_pct = static_cast<int>(std::lround(std::clamp(pct, 0.0, 100.0)));
             }
             busy_was[0] = busy_was[1];
             busy_at[0] = busy_at[1];
-            busy_was[1] = b;
-            busy_at[1] = now;
-            if (!busy_was[0].on) {  // the first refresh: the window starts here
-                busy_was[0] = b;
-                busy_at[0] = now;
+            busy_was[1] = busy_was[2];
+            busy_at[1] = busy_at[2];
+            busy_was[2] = b;
+            busy_at[2] = now;
+            for (int k = 0; k < 2; ++k) {
+                if (!busy_was[k].on) {  // the first refreshes: the window starts here
+                    busy_was[k] = b;
+                    busy_at[k] = now;
+                }
             }
         }
         float dw = 0.0f;
