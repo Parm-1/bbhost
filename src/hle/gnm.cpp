@@ -335,7 +335,18 @@ GUEST_ABI int hle_gnm_push_color_marker(std::uint32_t* cmd, unsigned size, const
 GUEST_ABI int hle_gnm_pop_marker(std::uint32_t* cmd, unsigned size) {
     return write_marker(cmd, size, kMarkerPop, nullptr, nullptr, 0);
 }
-GUEST_ABI int hle_gnm_wait_flip(void*, const void*, int, int) { return 0; }
+GUEST_ABI int hle_gnm_wait_flip(void* cmd, const void* dwords, int handle, int buffer) {
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = calls.fetch_add(1);
+    if (n < 8 || (n & (n + 1)) == 0) {
+        const auto* p = static_cast<const std::uint32_t*>(cmd);
+        host_log("gnm: sceGnmInsertWaitFlipDone #%llu cmd=%p dwords=%llu handle=%d buffer=%d: %08x %08x %08x %08x %08x %08x %08x (flip %llu)",
+                 static_cast<unsigned long long>(n + 1), cmd, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(dwords)), handle,
+                 buffer, p ? p[0] : 0u, p ? p[1] : 0u, p ? p[2] : 0u, p ? p[3] : 0u, p ? p[4] : 0u, p ? p[5] : 0u, p ? p[6] : 0u,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    return 0;
+}
 
 GUEST_ABI unsigned hle_gnm_cu_index(unsigned i) { return i; }
 GUEST_ABI unsigned hle_gnm_cu_mask(unsigned m) { return m; }
