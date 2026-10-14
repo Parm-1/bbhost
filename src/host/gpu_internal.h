@@ -976,6 +976,17 @@ extern std::uint32_t g_draw_dummies;
 // neighbours' a few flips after they were recorded.
 constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
+// BBHOST_VB_RACE=1 (render.cpp): each non-indexed draw's vertex range hashed
+// when recorded and again when its submission retires - memory rewritten while
+// the draw waited for the GPU. Caller holds the lock.
+bool vb_race_on();
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes);
+void vb_race_retired_locked(std::uint64_t serial);
+// buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the
+// GPU, the shadow on or off), and whether one over [va, va+bytes) is still to
+// land - recorded in a submission that has not retired. Caller holds the lock.
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's

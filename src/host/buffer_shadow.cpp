@@ -50,6 +50,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
@@ -770,7 +771,56 @@ void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::
     if (stale && at + 32 < n) std::snprintf(out + at, n - at, " <= %u STALE", stale);
 }
 
+// GPU writes by 64 KiB page, with the buffer shadow off too: the recording
+// the newest went into. render.cpp copies a constant buffer as its draw is
+// recorded only when no GPU write to its memory is still to land
+// (gpu_writes_pending_locked); landed pages leave the table as it grows.
+// A small write - a label, a counter, ~280 a frame - goes by 64-byte line: by
+// page, every label's page (the game keeps them beside its constants) read as
+// GPU-written for good, and its constants were never copied.
+namespace {
+constexpr unsigned kLineShift = 6;
+constexpr std::uint64_t kSmallWrite = 256;
+std::unordered_map<std::uint64_t, std::uint64_t> g_gpu_write_pages;
+std::map<std::uint64_t, std::uint64_t> g_gpu_write_lines;
+std::uint64_t g_gpu_write_notes = 0;
+}  // namespace
+
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return;
+    const std::uint64_t serial = g.flushes;  // the recording under way
+    if (bytes <= kSmallWrite) {
+        for (std::uint64_t l = va >> kLineShift; l <= (va + bytes - 1) >> kLineShift; ++l) g_gpu_write_lines[l] = serial;
+    } else {
+        const std::uint64_t first = va >> kPageShift, last = (va + bytes - 1) >> kPageShift;
+        if (last - first > (1u << 16)) return;  // 4 GiB: not a write anything makes
+        for (std::uint64_t p = first; p <= last; ++p) g_gpu_write_pages[p] = serial;
+    }
+    if (++g_gpu_write_notes % 4096 == 0) {  // landed writes leave
+        for (auto it = g_gpu_write_pages.begin(); it != g_gpu_write_pages.end();)
+            it = it->second < g.completed_submits ? g_gpu_write_pages.erase(it) : std::next(it);
+        for (auto it = g_gpu_write_lines.begin(); it != g_gpu_write_lines.end();)
+            it = it->second < g.completed_submits ? g_gpu_write_lines.erase(it) : std::next(it);
+    }
+}
+
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return false;
+    if (!g_gpu_write_pages.empty()) {
+        for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
+            const auto it = g_gpu_write_pages.find(p);
+            if (it != g_gpu_write_pages.end() && it->second >= g.completed_submits) return true;
+        }
+    }
+    const std::uint64_t last = (va + bytes - 1) >> kLineShift;
+    for (auto it = g_gpu_write_lines.lower_bound(va >> kLineShift); it != g_gpu_write_lines.end() && it->first <= last; ++it) {
+        if (it->second >= g.completed_submits) return true;
+    }
+    return false;
+}
+
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu) {
+    if (by_gpu) gpu_writes_note_locked(va, bytes);
     if (!buffer_shadow_on() || !bytes) return;
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;

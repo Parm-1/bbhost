@@ -4265,6 +4265,7 @@ void retire_slot_locked(int k) {
     vkResetFences(g.device, 1, &sl.fence);
     indirect_stats_retired_locked(sl.serial);
     indirect_clamp_retired_locked(sl.serial);
+    vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
@@ -5810,6 +5811,18 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         };
         for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        // BBHOST_VB_RACE=1: what the dispatch reads and never stores to, as
+        // the draws' constants are checked (render.cpp).
+        if (vb_race_on()) {
+            for (const gcn::BufferBinding& b : pl.meta.buffers) {
+                std::uint32_t v[4]{};
+                if (b.written || b.pointer || !resolve_resource(b.path, d.user_data, 4, v)) continue;
+                const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+                const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+                const std::uint64_t bytes = std::min<std::uint64_t>(stride ? std::uint64_t{v[2]} * stride : v[2], b.max_dw * 4ull);
+                if (base && bytes && !gpu_writes_pending_locked(base, bytes)) vb_race_note_locked(pl.name.c_str(), base, bytes);
+            }
+        }
         if (pl.meta.gds_counters) {
             for (const GpuDispatch::GdsCounter& c : d.gds) {
                 if (c.word) import_windows(c.word, 4);
