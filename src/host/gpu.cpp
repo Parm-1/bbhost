@@ -6772,6 +6772,40 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     return true;
 }
 
+bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || !bytes || bytes > 65536) return false;
+    if (surfaces_may_cover_locked(va, bytes) || find_render_target(va)) return false;
+    Located loc;
+    if (!locate_range(va, bytes, loc)) return false;
+    DevBuffer staging;
+    VkDeviceSize staging_offset = 0;
+    if (!acquire_staging_locked(staging, bytes, staging_offset)) return false;
+    std::memcpy(staging.map, data, bytes);
+    if (serial) *serial = g.flushes;  // the submission this write is recorded into
+    std::optional<DrawCmds> own;
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
+    transfer_begin_locked();
+    transfer_order_locked(VK_NULL_HANDLE, 0, loc.buffer, loc.offset, bytes);  // after what the work before reads and writes there
+    VkBufferCopy region{staging_offset, loc.offset, bytes};
+    DrawCmds* c = DrawCmds::open();
+    if (!c || !c->copy_buffer(staging.buffer, loc.buffer, region)) rec().copy_buffer(staging.buffer, loc.buffer, 1, &region);
+    transfer_end_locked();
+    shadow_written_locked(va, bytes, true);  // a constant buffer over it is read in place, behind the write
+    note_pending_write_locked(va, static_cast<const std::uint8_t*>(data), bytes);
+    return true;
+}
+
+void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    read_guest_locked(va, bytes, out);
+}
+
+bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    return gpu_writes_pending_locked(va, bytes);
+}
+
 bool host_gpu_clear_target(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
     return g.ok && render_clear_by_fill_locked(va, bytes, value);
