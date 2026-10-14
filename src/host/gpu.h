@@ -293,6 +293,19 @@ bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes); 
 // host_gpu_mem_write that also reports the submission serial the write is recorded
 // into: it is in memory once host_gpu_completed_submits() is past that serial.
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial);
+// A CP write that must land after GPU work already recorded (what the CP writes
+// itself after a wait it passed on a label that work is still to write): on the
+// GPU's timeline in stream order whatever its size, not held back to the end of
+// the command buffer as a small host_gpu_mem_write is, and seen by the reads
+// made while recording. False - the caller waits for the GPU and writes on the
+// CPU - when the range is not imported, is over 64 KiB, or may hold a texture or
+// a render target (their caches follow the CPU's writes).
+bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial);
+// Guest memory as the work being recorded now will see it (the CP writes still
+// queued applied on top), and whether a GPU write recorded into a submission
+// that has not run yet covers any of it.
+void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out);
+bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes);
 // Submissions whose fence has retired, in order (trails the GPU: a write may be
 // in memory before this passes its serial).
 std::uint64_t host_gpu_completed_submits();
