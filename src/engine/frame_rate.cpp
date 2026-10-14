@@ -9,6 +9,7 @@
 #include "engine/lua_events.h"
 #include "engine/world_chr.h"
 #include "engine/params.h"
+#include "engine/paramdef.h"
 #include "engine/sprj_flipper.h"
 #include "engine/loading.h"
 #include "engine/menu_steps.h"
@@ -98,8 +99,8 @@ constexpr std::uint32_t kModeSixty = 2;
 // accumulator (0x4d2577c, read through the frame's time below anyway), and
 // the follow camera's chase-rate ease (0x4d25e94: 1 - (1 - 1/30)^(30 dt)).
 // The physics world's expected minimum step (hkpWorldCinfo, 0x0f383ca) is a
-// tolerance hint at 1/fps; 0x4d29170's step is read by one load the 60 FPS++
-// sites point at the frame's time.
+// tolerance hint at 1/fps; 0x4d29170's step is read by one load, the
+// effects' (kSfxStepLoad), which reads a step of ours instead.
 // Not here: the effects' rate. The effect manager's constructor (sub_26fb190)
 // stores 30.0 at its +0 (the immediate at 0x26fb39f) and the GPU particle
 // update multiplies elapsed seconds by 0x4cad7fc (30.0): both turn effect
@@ -478,6 +479,40 @@ constexpr std::uint32_t kStepLoad = 0x2418e3d;
 constexpr char kStepLoadWas[] = "f30f108364020000f30f5f4318f30f5d0512d59002";
 static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions are 21 bytes");
 
+// The effects' step. SprjSfx::Update (0x2377bd0, once a frame from
+// SprjGraphicsStep::STEP_Update) hands the effect manager's update (vfunc
+// +0x40, 0x26ff340) the one 1/30 it loads at 0x2377d4a - 0 while its +0x8c
+// asks for a still frame - and the 60 FPS++ sites point that load at the
+// frame-time slot. Effect data are in 30 fps frames (durations frames / 30.0,
+// the GPU particles' elapsed seconds x 30.0), so on the PS4 each update is
+// one whole data frame. With the frame's time each is a share of one that
+// moves from frame to frame, and in Kyo's 90, 120 and Uncap lists Ebrietas's
+// effects broke and her rock debris spawned without end, as they did not at
+// 60, where the step holds a steady 1/60 (2026-10-13; his old
+// "60 FPS + (deltatime)" list, a fixed 1/60, "fixes ebrietas' sfx crash").
+// Ours is that steady 1/60: the task step in whole 1/60 s, the rest carried
+// to the next frame - 0, 1/60, 1/60 at 90; 0, 1/60 at 120 - so the effects
+// run at 60 updates a second at every rate above it. A 0 between is the
+// still frame the effect manager makes itself (its +0x5ce zeroes the step and
+// runs the whole update). BBHOST_SFX_STEP=frame steps them by the frame's
+// time again.
+constexpr std::uint32_t kSfxStepLoad = 0x2377d4a;
+constexpr char kSfxStepLoadSixty[] = "c5fa1005b62b3e03";  // vmovss xmm0,[0x575a908], as the 60 FPS++ sites leave it
+
+// The Bloodletter's transformed L2 (a146.tae anim 46000; the three
+// Bloodletters' behaviorVariationId 2900) gives its wielder a frenzy aura
+// (SpEffect 5286: 5296's 4 frenzy every 0.1 s for 5 s) through one attack
+// that hits only them: AtkParam_Pc 2900931 (selfTarget, no damage), a 0.4 m
+// sphere on the weapon (dummy 12130) live for one 30 fps frame of the slam
+// (1.000-1.033 s). Posed with the hit bodies it overlaps the right hand's
+// ragdoll capsule by 5 cm; when those trail the pose by even 1/120 s it
+// misses, and above 30 the aura never came (Kyo, 2026-10-13: only at 30 did
+// the L2 build frenzy). At 0.6 m it overlaps by 25 cm, and by 1 cm with a
+// whole 1/30 s of trail. Written at the converted rates when the table is
+// loaded or reloaded (engine/params.cpp), only over the game's own 0.4.
+constexpr std::uint32_t kBloodletterSelfHit = 2900931;
+constexpr std::uint32_t kSelfHitRadiusWas = 0x3ecccccd, kSelfHitRadiusNow = 0x3f19999a;  // hit0_Radius 0.4, 0.6
+
 // The Camera tuning option (host/options.cpp camera_tuning;
 // BBHOST_CAMERA_TUNING=fps++|original), read when the game starts. FPS++
 // keeps Kyo's retune of the follow camera from his 60 FPS++ list, as bbhost
@@ -700,6 +735,9 @@ double g_play_ms_carry = 0.0;
 // scale scales the step, not the frames' pace.
 std::uint64_t g_step_va = 0;
 std::atomic<bool> g_scale_by_step{false};
+// The effects' step (kSfxStepLoad) and the part of a 1/60 s carried.
+std::uint64_t g_sfx_step_va = 0;
+double g_sfx_carry = 0.0;
 // The redirected loads' slots (kDtLoads): one per constant, kind and width,
 // 16 bytes each in the image's tail, rewritten every frame from the constant
 // as it is then (a .data tunable the debug menu edits keeps working).
@@ -1326,6 +1364,13 @@ void each_frame(const SprjFlipper* f) {
             g_play_ms_carry -= ms;
             put<std::int32_t>(g_play_ms_va, ms);
         }
+        if (g_sfx_step_va) {
+            // The step in whole 1/60 s (at most 2), the rest carried.
+            g_sfx_carry += static_cast<double>(step);
+            const double n = std::floor(g_sfx_carry * 60.0 + 1e-6);
+            g_sfx_carry -= n / 60.0;
+            put<float>(g_sfx_step_va, static_cast<float>(n / 60.0));
+        }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
     const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
@@ -1571,8 +1616,9 @@ int apply_rate(ElfImage* image, int want) {
         // (with the guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the cave and
         // the game's add stay).
         const std::uint64_t block = image->tail_va + image->tail_used + kPreferredGuestSlide;  // as a BN address
-        const std::uint64_t step_bn = block, play_bn = block + 8;
+        const std::uint64_t step_bn = block, sfx_bn = block + 4, play_bn = block + 8;
         const std::int64_t step_disp = static_cast<std::int64_t>(step_bn) - static_cast<std::int64_t>(kStepLoad + 8);
+        const std::int64_t sfx_disp = static_cast<std::int64_t>(sfx_bn) - static_cast<std::int64_t>(kSfxStepLoad + 8);
         const std::int64_t play_disp = static_cast<std::int64_t>(play_bn) - static_cast<std::int64_t>(kPlayTimeAdd + 6);
         const auto holds = [&](std::uint32_t at, const char* hex) {
             const std::vector<std::uint8_t> was = hex_bytes(hex);
@@ -1581,7 +1627,7 @@ int apply_rate(ElfImage* image, int want) {
         const auto rel32 = [](std::int64_t d) { return d >= INT32_MIN && d <= INT32_MAX; };
         if (g_source != Source::Ours) {
             host_log("frame rate: the guest's SprjFlipper::Update runs; the task step and the play time stay the game's");
-        } else if (image->tail_used + 16 > image->tail_size || !rel32(step_disp) || !rel32(play_disp)) {
+        } else if (image->tail_used + 16 > image->tail_size || !rel32(step_disp) || !rel32(sfx_disp) || !rel32(play_disp)) {
             host_log("frame rate: no room in the image's tail; the task step and the play time stay the game's");
         } else {
             image->tail_used += 16;
@@ -1610,6 +1656,22 @@ int apply_rate(ElfImage* image, int want) {
                 write(kPlayTimeAdd, now, sizeof(now));
             } else {
                 host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
+            }
+            const char* sfx_env = std::getenv("BBHOST_SFX_STEP");
+            if (sfx_env && std::strcmp(sfx_env, "frame") == 0) {
+                host_log("frame rate: BBHOST_SFX_STEP=frame: the effects step by the frame's time");
+            } else if (holds(kSfxStepLoad, kSfxStepLoadSixty)) {
+                g_sfx_step_va = va(static_cast<std::uint32_t>(sfx_bn));
+                put<float>(g_sfx_step_va, kSixtieth);
+                std::uint8_t disp[4];
+                le(sfx_disp, disp);
+                write(kSfxStepLoad + 4, disp, sizeof(disp));
+                host_log("frame rate: the effects step in whole 1/60 s, the rest carried (SprjSfx::Update's load at 0x%x)",
+                         kSfxStepLoad);
+            } else {
+                host_log("frame rate: 0x%x is not the 60 FPS++ sites' load of the frame-time slot; the effects step by the "
+                         "frame's time",
+                         kSfxStepLoad);
             }
         }
         // The redirected loads (kDtLoads): every instruction checked, then
@@ -1819,6 +1881,31 @@ void frame_rate_install(ElfImage* image) {
              g_step_va ? ", the task step ours" : "", g_play_ms_va ? ", the play time's add" : "");
     if (got != want)
         host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want).c_str(), mode_name(got).c_str());
+}
+
+void frame_rate_atk_params_loaded() {
+    if (g_game_fps == 30) return;
+    std::size_t bytes = 0;
+    auto* row = static_cast<std::uint8_t*>(params_row("AtkParam_Pc", kBloodletterSelfHit, &bytes));
+    const ParamDefinition* def = params_definition("AtkParam_Pc");
+    const ParamField* field = def ? def->field("hit0_Radius") : nullptr;
+    const std::uint32_t at = field ? field->offset : 0;  // the first field of ATK_PARAM_ST
+    if (!row || (bytes && bytes < at + 4)) {
+        host_log("frame rate: AtkParam_Pc has no row %u; the Bloodletter's self-hit stays the game's", kBloodletterSelfHit);
+        return;
+    }
+    std::uint32_t radius;
+    std::memcpy(&radius, row + at, sizeof(radius));
+    if (radius == kSelfHitRadiusNow) return;
+    if (radius != kSelfHitRadiusWas) {
+        host_log("frame rate: AtkParam_Pc row %u's hit0_Radius is %g, not the game's 0.4; left as it is", kBloodletterSelfHit,
+                 static_cast<double>(bits_float(radius)));
+        return;
+    }
+    std::memcpy(row + at, &kSelfHitRadiusNow, sizeof(kSelfHitRadiusNow));
+    host_log("frame rate: AtkParam_Pc row %u's hit0_Radius 0.4 -> 0.6 m (the Bloodletter's L2 self-hit, its frenzy aura "
+             "above 30)",
+             kBloodletterSelfHit);
 }
 
 void frame_rate_set_time_scale(float scale) {
