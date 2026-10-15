@@ -10,6 +10,7 @@
 #include "engine/frame_rate.h"
 #include "engine/live_resolution.h"
 #include "engine/menu_memory.h"
+#include "engine/patch_manifest.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
 #include "host/options.h"
@@ -875,29 +876,39 @@ bool install_jump_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, 
 //   2 x 2 tiles (960x540)      6.14 / 12.1
 //   4 x 4 tiles (480x270)      5.98 / 12.5             373k draws
 //
-// so the tile here is a quarter of the frame on each axis - most of the CPU
-// saved, none of the GPU added - and the frame is the larger of the
-// presented image (window, or display in fullscreen) and the render size,
+// so the tile here is a sixth of the frame on each axis (g_tiles_per_axis,
+// below, for the measurements that chose it) and the frame is the larger of
+// the presented image (window, or display in fullscreen) and the render size,
 // with one job ("Div" 1x1). Written on every view when it changed: the size
 // is read each frame (0x26a5d22, 0x26b4cb7) and the bins are allocated per
 // frame, so a resize or a new render size takes effect on the next frame.
 // Never 0 - it is a divisor (0x26a5d43). BBHOST_LIGHT_GRID=0 keeps the
-// game's tiles and jobs; =WxH a fixed tile, for measuring.
+// game's tiles and jobs; =<N> N tiles a side (1: one tile, the frame); =WxH
+// a fixed tile, for measuring.
 constexpr std::uint64_t kGraphicsManagerSlot = 0x5940dd8;
 constexpr std::uint64_t kLightGridDiv = 0x553ae80;  // x, y
 constexpr std::size_t kLightTileW = 0x78a8, kLightTileH = 0x78ac;
 const std::uint64_t* g_graphics_manager = nullptr;  // the slot, slid; null when off
 const std::uint32_t* g_res_words = nullptr;         // render width, height
 std::uint32_t g_tile_fixed[2] = {0, 0};             // BBHOST_LIGHT_GRID=WxH: that tile instead (experiments)
-// Tiles a side: 1 - one tile the window's size, Kyo's "REAL LightGrid 1080p"
-// (the constructor's 1920x1080) at whatever size the window or display is, in
-// one job ("Light Grid Div 1x1"): each light binned and drawn once. 4 (a
-// quarter of the window each way) with BBHOST_LIGHT_GRID=quarter. Measured on
-// a Radeon 8060S: 2026-10-08, the Hunter's Dream, GPU ms per 300 flips, 4 a
-// side 1,878-2,027 and one tile 1,960-2,096; 2026-10-12, Kyo's area uncapped
-// and GPU-bound, Model detail Normal, 45 s each: one tile 160.2 fps, 4 a side
-// 159.2, the game's own 128x128 tiles in 3x3 jobs (BBHOST_LIGHT_GRID=0) 165.1.
-std::uint32_t g_tiles_per_axis = 1;
+// Tiles a side, in one job ("Light Grid Div 1x1"): 6, a sixth of the frame
+// each way (320x180 at 1080p, 640x360 at 4K), so the count stays the same at
+// every resolution. 1 is one tile the frame's size, Kyo's "REAL LightGrid
+// 1080p" (the constructor's 1920x1080) at whatever size the window or display
+// is: each light binned and drawn once, but every light group shaded over the
+// whole frame. Measured on a Radeon 8060S: 2026-10-08, the Hunter's Dream, GPU
+// ms per 300 flips, 4 a side 1,878-2,027 and one tile 1,960-2,096; 2026-10-12,
+// Kyo's area uncapped and GPU-bound, Model detail Normal, 45 s each: one tile
+// 160.2 fps, 4 a side 159.2, the game's own 128x128 tiles in 3x3 jobs
+// (BBHOST_LIGHT_GRID=0) 165.1. 2026-10-14, the room NVIDIA players drop to
+// ~35 fps in (Kyo's save; 1080p, headless, the light pass's GPU ms a frame /
+// draws a frame / the command processor's ms a frame, two runs each in
+// A-B-C-C-B-A order): one tile 1.45-1.51 / 885, the game's tiles 0.87 / 1162,
+// 4 a side 0.83-0.86 / 918 / 6.8, 6 a side 0.74-0.76 / 961 / 6.5-6.7, 8 a side
+// 0.73-0.76 / 1020 / 7.3 - 8 shades no less than 6 and its ~60 more draws
+// cost the command processor ~0.7 ms. BBHOST_LIGHT_GRID=<N> sets N (=1 the
+// one tile of before, =quarter 4).
+std::uint32_t g_tiles_per_axis = 6;
 // The tile is the GraphicsManager's own, written once by its constructor
 // (sub_26958d0: mov dword [rbx+0x78a8], 128 at 0x2695cb6 and [rbx+0x78ac] at
 // 0x2695cc0 - Kyo's "REAL LightGrid 1080p" puts 1920 and 1080 there) and
@@ -1047,6 +1058,10 @@ void light_grid_install(ElfImage* image) {
         return;
     }
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "quarter") == 0) g_tiles_per_axis = 4;
+    // =<N>: N tiles a side (1 is one tile the frame's size).
+    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && *e >= '1' && *e <= '9' && !std::strchr(e, 'x')) {
+        g_tiles_per_axis = static_cast<std::uint32_t>(std::clamp(std::atoi(e), 1, 32));
+    }
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strchr(e, 'x')) {
         g_tile_fixed[0] = static_cast<std::uint32_t>(std::atoi(e));
         g_tile_fixed[1] = static_cast<std::uint32_t>(std::atoi(std::strchr(e, 'x') + 1));
@@ -1090,8 +1105,8 @@ void light_grid_install(ElfImage* image) {
     }
     host_window_on_pixels(&light_grid_window);
     host_log("graphics: light grid - one job of %ux%u tiles sized to the larger of the window and the render size, set by the "
-             "manager's constructor and again only when either changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=quarter: "
-             "4x4, =0: the game's)",
+             "manager's constructor and again only when either changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=<N>: N "
+             "a side, =1 one tile, =0 the game's)",
              g_tiles_per_axis, g_tiles_per_axis, patched ? "; the split was 1x1 already, a patch's" : "");
 }
 
@@ -1464,6 +1479,76 @@ void resolution_patch(ElfImage* image, bool live) {
     ui_stage_pin(image);
 }
 
+// Motion blur's buffers at a fixed size whatever the render size, as every
+// "Resolution Patch WxH" in Kyo's shadPS4 list has them: the scene context's
+// velocity map pair (+0xce0/+0xd38, made only in its Initialize, sub_26c39f0)
+// at 640x360, and the depth renders the velocity pass tests against
+// (sub_125b140, its one caller in the same function) at 640x360 and 320x180 -
+// the game's own are half and a quarter of the render size. The same bytes as
+// patches/low-res-aux-targets.toml, here so that a player who copies only the
+// new exe over an older folder gets them too: an RTX 5080 log ran from a
+// v0.2.16 folder with no such manifest, and its velocity map was 960x540 at
+// 1080p. Written after the manifests: a site a manifest wrote (that one, the
+// HD Motion Blur ones, Screen Space Reflections, Performance Patch v3) is left
+// as it wrote it. [patches] low-res-aux-targets = false or BBHOST_LOW_RES_AUX=0
+// keeps the game's sizes.
+void aux_targets_baseline(ElfImage* image) {
+    if (const char* e = std::getenv("BBHOST_LOW_RES_AUX"); (e && e[0] == '0') || patch_manifest_off("low-res-aux-targets")) {
+        host_log("graphics: motion blur's buffers at the game's sizes (half and a quarter of the render size)");
+        return;
+    }
+    struct Site {
+        std::uint64_t at;
+        std::uint8_t len;
+        std::uint8_t was[10], now[10];
+    };
+    static const Site kSites[] = {
+        // mov eax, [r15]; shr eax, 1 -> mov eax, 640 (the velocity map's width)
+        {0x26c3de4, 5, {0x41, 0x8b, 0x07, 0xd1, 0xe8}, {0xb8, 0x80, 0x02, 0x00, 0x00}},
+        // mov eax, [r15+4]; shr eax, 1 -> mov eax, 360; nop
+        {0x26c3df0, 6, {0x41, 0x8b, 0x47, 0x04, 0xd1, 0xe8}, {0xb8, 0x68, 0x01, 0x00, 0x00, 0x90}},
+        // mov eax, [rbx]; shr eax, 1; mov [rsp], eax -> mov dword [rsp], 640
+        {0x125b1a3, 7, {0x8b, 0x03, 0xd1, 0xe8, 0x89, 0x04, 0x24}, {0xc7, 0x04, 0x24, 0x80, 0x02, 0x00, 0x00}},
+        // mov eax, [rbx+4]; shr eax, 1; mov [rsp+4], eax -> mov dword [rsp+4], 360
+        {0x125b1aa, 9, {0x8b, 0x43, 0x04, 0xd1, 0xe8, 0x89, 0x44, 0x24, 0x04}, {0xc7, 0x44, 0x24, 0x04, 0x68, 0x01, 0x00, 0x00, 0x90}},
+        // mov eax, [rbx]; shr eax, 2; mov [rsp], eax -> mov dword [rsp], 320
+        {0x125b1d6, 8, {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24}, {0xc7, 0x04, 0x24, 0x40, 0x01, 0x00, 0x00, 0x90}},
+        // mov eax, [rbx+4]; shr eax, 2; mov [rsp+4], eax -> mov dword [rsp+4], 180
+        {0x125b1de, 10, {0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04},
+         {0xc7, 0x44, 0x24, 0x04, 0xb4, 0x00, 0x00, 0x00, 0x90, 0x90}},
+    };
+    int written = 0, already = 0, owned = 0, refused = 0;
+    std::string owners;
+    for (const Site& s : kSites) {
+        if (const char* o = patch_manifest_owner(s.at, s.len)) {
+            ++owned;
+            if (owners.find(o) == std::string::npos) owners += std::string(owners.empty() ? "" : ", ") + o;
+            continue;
+        }
+        const std::uint64_t at = image->mem.slide + (s.at - kPreferredGuestSlide);
+        auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
+        if (std::memcmp(p, s.now, s.len) == 0) {
+            ++already;
+            continue;
+        }
+        if (std::memcmp(p, s.was, s.len) != 0) {
+            ++refused;
+            continue;
+        }
+        const std::uint64_t lo = at & ~0xfffull, hi = (at + s.len + 0xfff) & ~0xfffull;
+        if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
+            ++refused;
+            continue;
+        }
+        std::memcpy(p, s.now, s.len);
+        guest_protect_rx(&image->mem, lo, hi - lo);
+        ++written;
+    }
+    host_log("graphics: motion blur's buffers - the velocity map and the depth it tests against at 640x360, the quarter-size "
+             "depth at 320x180, at every resolution: %d of 6 sites written, %d already%s%s%s, %d refused (not the game's bytes)",
+             written, already, owned ? ", left to " : "", owned ? owners.c_str() : "", owned ? " where it wrote them" : "", refused);
+}
+
 }  // namespace
 
 bool engine_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host,
@@ -1507,6 +1592,7 @@ std::string graphics_glare_report() {
 
 void graphics_patch_install(ElfImage* image) {
     resolution_patch(image, live_resolution_install(image));
+    aux_targets_baseline(image);
     menu_memory_install(image);
     frame_rate_install(image);
     camera_install(image);
